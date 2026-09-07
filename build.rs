@@ -39,8 +39,9 @@ fn main() {
         .include(includedir.trim())
         .flag_if_supported("-std=c++17")
         // LLVM's headers intentionally contain unused parameters in template
-        // interfaces. Warnings from our own code remain errors in CI via the
-        // standalone compiler check, but suppress dependency-header noise here.
+        // interfaces. The end-to-end test script separately compiles this
+        // bridge with warnings as errors, while this build suppresses noise
+        // originating in dependency headers.
         .warnings(false);
 
     for flag in cxxflags.split_whitespace() {

@@ -150,8 +150,21 @@ if [ "$(uname -s)" = Darwin ] && command -v xcrun >/dev/null 2>&1; then
   sdk_path=$(xcrun --show-sdk-path)
   sdk_flags="-isysroot $sdk_path"
 fi
+
+cxx="$llvm_prefix/bin/clang++"
+llvm_cxxflags=$("$llvm_prefix/bin/llvm-config" --cxxflags)
 # shellcheck disable=SC2086
-"$clang" $sdk_flags -O2 -fno-vectorize -fno-slp-vectorize \
+"$cxx" $sdk_flags $llvm_cxxflags -std=c++17 -Wall -Wextra -Werror \
+  -Wno-unused-parameter -fsyntax-only native/pass_plugin.cpp
+
+# Keep checked-in native fixtures and benchmarks warning-clean as ordinary C.
+# shellcheck disable=SC2086
+"$clang" $sdk_flags -std=c11 -Wall -Wextra -Werror -fsyntax-only \
+  tests/runtime_harness.c benchmarks/kernels.c benchmarks/cloned_kernels.c \
+  benchmarks/harness.c
+
+# shellcheck disable=SC2086
+"$clang" $sdk_flags -O2 -Wno-override-module -fno-vectorize -fno-slp-vectorize \
   "$build_dir/vectorized.ll" tests/runtime_harness.c \
   -o "$build_dir/runtime-check"
 "$build_dir/runtime-check"

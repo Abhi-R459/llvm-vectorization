@@ -5,4 +5,6 @@
 *.o
 *.dylib
 *.so
-
+__pycache__/
+*.pyc
+/.research/
