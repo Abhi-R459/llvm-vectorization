@@ -1,0 +1,141 @@
+{
+  "schema_version": 2,
+  "generated_at_utc": "2026-09-07T19:51:05.934031+00:00",
+  "command": "./scripts/benchmark.py --warmups 3 --samples 21 --inner-calls 64 --timing-runs 15",
+  "provenance": {
+    "source_revision": "8eab95e691bf6dd12773d44a464230a151c420b9",
+    "plugin_sha256": "54c91f0b69aa567c5c3d05c94a21eff87cf36dff077b2e107bae70bb44851053",
+    "canonical_scalar_ir_sha256": "7be84d44b098f69d44b95f8abd4d808a92f1a1e5d26df61c116aee719ae9d262",
+    "note": "Benchmark-relevant source and harness files match this revision; this documentation snapshot was committed afterward."
+  },
+  "host": {
+    "cpu": "Apple M5",
+    "system": "Darwin 25.5.0",
+    "machine": "arm64",
+    "python": "3.10.1"
+  },
+  "toolchain": {
+    "llvm": "21.1.3",
+    "rustc": "rustc 1.90.0 (1159e78c4 2025-09-14) (Homebrew)",
+    "target_triple": "arm64-apple-darwin25.5.0"
+  },
+  "configuration": {
+    "elements": 32771,
+    "warmups": 3,
+    "samples": 21,
+    "inner_calls": 64,
+    "timing_runs": 15,
+    "cloned_loops": 128,
+    "runtime_execution_order": [
+      "llvm",
+      "custom",
+      "scalar"
+    ],
+    "canonical_compile_flags": [
+      "-isysroot",
+      "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk",
+      "-std=c11",
+      "-O1",
+      "-fno-vectorize",
+      "-fno-slp-vectorize",
+      "-fno-unroll-loops",
+      "-ffp-contract=off",
+      "-fno-discard-value-names",
+      "-emit-llvm",
+      "-c"
+    ],
+    "common_backend_flags": [
+      "-O=3",
+      "--mcpu=native",
+      "--filetype=obj"
+    ],
+    "common_link_flags": [
+      "-isysroot",
+      "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk",
+      "-fno-lto"
+    ]
+  },
+  "correctness": {
+    "scalar": "ok",
+    "custom": "ok",
+    "llvm": "ok"
+  },
+  "vectorization": {
+    "custom_kernels": "7/7",
+    "llvm_kernels": "7/7",
+    "custom_cloned_loops": "128/128"
+  },
+  "runtime_geomean_speedup_vs_scalar": {
+    "custom": 3.008593,
+    "llvm": 2.973528
+  },
+  "runtime_kernel_speedup_vs_scalar": {
+    "add_f32": {
+      "custom": 2.512563,
+      "llvm": 2.512563
+    },
+    "conditional_adjust_i32": {
+      "custom": 3.05914,
+      "llvm": 3.05914
+    },
+    "increment_i32": {
+      "custom": 4.032258,
+      "llvm": 4.032258
+    },
+    "mul_add_f32": {
+      "custom": 2.497512,
+      "llvm": 2.522613
+    },
+    "scale_i32": {
+      "custom": 3.864662,
+      "llvm": 3.923664
+    },
+    "widen_u16": {
+      "custom": 3.729323,
+      "llvm": 6.794521
+    },
+    "write_index_u64": {
+      "custom": 2,
+      "llvm": 0.986139
+    }
+  },
+  "custom_internal_microseconds_per_cloned_loop": {
+    "analysis": {
+      "p50": 0.7705,
+      "p95": 2.47315,
+      "p99": 13.81991,
+      "max": 17.375
+    },
+    "transform": {
+      "p50": 1.583,
+      "p95": 5.38135,
+      "p99": 22.76859,
+      "max": 33.167
+    },
+    "analysis_plus_transform": {
+      "p50": 2.3545,
+      "p95": 8.7899,
+      "p99": 31.40434,
+      "max": 36.708
+    }
+  },
+  "process_median_milliseconds": {
+    "no_op_verify": 9.732583,
+    "plugin_load_no_op_verify": 10.098917,
+    "custom_pass_verify": 10.684125,
+    "llvm_loop_vectorize_verify": 21.632542
+  },
+  "baseline_adjusted_median_microseconds_per_loop": {
+    "custom": 4.571938,
+    "llvm": 92.96843
+  },
+  "interpretation": [
+    "Runtime results are cache-hot kernel microbenchmarks, not application-level speedups.",
+    "The script performs warmup and repeated high-resolution measurements but does not disable ASLR, frequency scaling, Turbo Boost, background services, or pin CPU affinity.",
+    "Custom analysis_us/transform_us values come from in-pass Rust timers; they exclude opt startup, bitcode parsing, plugin loading, verification, serialization, and remark I/O.",
+    "Process-level times include process startup, parsing, target setup, and verification. Baseline subtraction is an approximate per-loop estimate and can be distorted by fixed costs and noise.",
+    "The 128 cloned loops are deliberately small, isomorphic, and bounded; their latency distribution cannot establish a universal microsecond bound for arbitrary LLVM IR.",
+    "LLVM and custom variants share byte-identical input bitcode and identical backend/link flags, but each transformation may expose different downstream code-generation opportunities.",
+    "Estimated vector coverage and issued-lane utilization are static compiler estimates; neither is equivalent to active hardware-lane occupancy or measured speedup."
+  ]
+}
