@@ -122,3 +122,62 @@ exit:
   ret void
 }
 
+; Same legality shape as increment_in_place, with the canonical `ne` latch
+; orientation (continue while next != trip count).
+define void @increment_in_place_ne(ptr noalias %data, i64 %n) {
+entry:
+  %empty = icmp eq i64 %n, 0
+  br i1 %empty, label %exit, label %loop
+
+loop:
+  %i = phi i64 [ 0, %entry ], [ %next, %loop ]
+  %element.ptr = getelementptr inbounds i32, ptr %data, i64 %i
+  %old = load i32, ptr %element.ptr, align 4
+  %new = add i32 %old, 2
+  store i32 %new, ptr %element.ptr, align 4
+  %next = add nuw i64 %i, 1
+  %continue = icmp ne i64 %next, %n
+  br i1 %continue, label %loop, label %exit
+
+exit:
+  ret void
+}
+
+; Canonical unsigned counted latch (continue while next < trip count).
+define void @increment_in_place_ult(ptr noalias %data, i64 %n) {
+entry:
+  %empty = icmp eq i64 %n, 0
+  br i1 %empty, label %exit, label %loop
+
+loop:
+  %i = phi i64 [ 0, %entry ], [ %next, %loop ]
+  %element.ptr = getelementptr inbounds i32, ptr %data, i64 %i
+  %old = load i32, ptr %element.ptr, align 4
+  %new = add i32 %old, 3
+  store i32 %new, ptr %element.ptr, align 4
+  %next = add nuw i64 %i, 1
+  %continue = icmp ult i64 %next, %n
+  br i1 %continue, label %loop, label %exit
+
+exit:
+  ret void
+}
+
+; Widening must retain program order for multiple same-iteration stores.
+define void @ordered_double_store(ptr noalias %data, i64 %n) {
+entry:
+  %empty = icmp eq i64 %n, 0
+  br i1 %empty, label %exit, label %loop
+
+loop:
+  %i = phi i64 [ 0, %entry ], [ %next, %loop ]
+  %element.ptr = getelementptr inbounds i32, ptr %data, i64 %i
+  store i32 111, ptr %element.ptr, align 4
+  store i32 222, ptr %element.ptr, align 4
+  %next = add nuw i64 %i, 1
+  %done = icmp eq i64 %next, %n
+  br i1 %done, label %exit, label %loop
+
+exit:
+  ret void
+}

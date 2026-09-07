@@ -48,14 +48,22 @@ bool rv_loop_vectorization_disabled(void *instruction) {
   return enabled && enabled->isZero();
 }
 
-bool rv_vector_memory_layout_is_packed(void *module, void *elementType,
+bool rv_vector_memory_layout_is_packed(void *module, void *basePointer,
+                                       void *elementType,
                                        unsigned vectorFactor) {
   auto *llvmModule = static_cast<llvm::Module *>(module);
+  auto *baseValue =
+      llvm::unwrap(reinterpret_cast<LLVMValueRef>(basePointer));
   auto *scalarType = llvm::unwrap(reinterpret_cast<LLVMTypeRef>(elementType));
-  if (!scalarType->isSized() || vectorFactor < 2)
+  auto *pointerType = llvm::dyn_cast<llvm::PointerType>(baseValue->getType());
+  if (!pointerType || !scalarType->isSized() || vectorFactor < 2)
     return false;
 
   const auto &layout = llvmModule->getDataLayout();
+  // The affine proof is over the full i64 induction domain. A narrower GEP
+  // index would silently truncate it and introduce modular wraparound aliases.
+  if (layout.getIndexSizeInBits(pointerType->getAddressSpace()) != 64)
+    return false;
   const auto scalarAllocation = layout.getTypeAllocSize(scalarType);
   const auto scalarStore = layout.getTypeStoreSize(scalarType);
   const auto vectorStore = layout.getTypeStoreSize(
@@ -107,24 +115,54 @@ bool parsePassName(llvm::StringRef name, RVPassConfig &config) {
     config.heuristic = 0;
     return true;
   }
+  if (name == "rust-loop-vectorize-conservative-report") {
+    config.heuristic = 0;
+    config.emit_remarks = 1;
+    return true;
+  }
   if (name == "rust-loop-vectorize-aggressive") {
     config.heuristic = 2;
+    return true;
+  }
+  if (name == "rust-loop-vectorize-aggressive-report") {
+    config.heuristic = 2;
+    config.emit_remarks = 1;
     return true;
   }
   if (name == "rust-loop-vectorize-force-vf2") {
     config.forced_vf = 2;
     return true;
   }
+  if (name == "rust-loop-vectorize-force-vf2-report") {
+    config.forced_vf = 2;
+    config.emit_remarks = 1;
+    return true;
+  }
   if (name == "rust-loop-vectorize-force-vf4") {
     config.forced_vf = 4;
+    return true;
+  }
+  if (name == "rust-loop-vectorize-force-vf4-report") {
+    config.forced_vf = 4;
+    config.emit_remarks = 1;
     return true;
   }
   if (name == "rust-loop-vectorize-force-vf8") {
     config.forced_vf = 8;
     return true;
   }
+  if (name == "rust-loop-vectorize-force-vf8-report") {
+    config.forced_vf = 8;
+    config.emit_remarks = 1;
+    return true;
+  }
   if (name == "rust-loop-vectorize-force-vf16") {
     config.forced_vf = 16;
+    return true;
+  }
+  if (name == "rust-loop-vectorize-force-vf16-report") {
+    config.forced_vf = 16;
+    config.emit_remarks = 1;
     return true;
   }
   return false;

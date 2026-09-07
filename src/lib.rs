@@ -10,6 +10,7 @@ mod dependence;
 mod llvm;
 mod vectorizer;
 
+use std::cell::Cell;
 use std::ffi::{c_char, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
@@ -18,6 +19,22 @@ use config::{Heuristic, PassConfig};
 const PLUGIN_API_VERSION: u32 = 1;
 const PLUGIN_NAME: &[u8] = b"rust-loop-vectorizer\0";
 const PLUGIN_VERSION: &[u8] = concat!(env!("CARGO_PKG_VERSION"), "\0").as_bytes();
+
+thread_local! {
+    /// Sticky for the duration of one FFI invocation. If Rust panics after any
+    /// IR mutation, returning `false` would let LLVM keep using invalidated
+    /// analyses (and could expose partially-built IR). Such an internal bug is
+    /// therefore fail-stop instead of recoverable.
+    static IR_WAS_MUTATED: Cell<bool> = const { Cell::new(false) };
+}
+
+pub(crate) fn mark_ir_mutated() {
+    IR_WAS_MUTATED.set(true);
+}
+
+fn take_ir_mutated() -> bool {
+    IR_WAS_MUTATED.replace(false)
+}
 
 #[repr(C)]
 struct PassPluginLibraryInfo {
@@ -64,7 +81,9 @@ pub unsafe extern "C" fn rv_run_module(
         return false;
     }
 
-    catch_unwind(AssertUnwindSafe(|| {
+    // Each invocation starts with a clean thread-local mutation state.
+    let _ = take_ir_mutated();
+    let result = catch_unwind(AssertUnwindSafe(|| {
         // SAFETY: LLVM invokes the adapter with a live Module and the adapter
         // passes a pointer to its by-value configuration for this call.
         let ffi_config = unsafe { *raw_config };
@@ -74,8 +93,18 @@ pub unsafe extern "C" fn rv_run_module(
             ffi_config.emit_remarks != 0,
         );
         run_module(raw_module, config)
-    }))
-    .unwrap_or(false)
+    }));
+    let mutated = take_ir_mutated();
+    match result {
+        Ok(changed) => changed,
+        Err(_) if mutated => {
+            eprintln!(
+                "rust-loop-vectorizer: internal failure after IR mutation; aborting to prevent corrupted output"
+            );
+            std::process::abort();
+        }
+        Err(_) => false,
+    }
 }
 
 fn run_module(raw_module: *mut c_void, config: PassConfig) -> bool {

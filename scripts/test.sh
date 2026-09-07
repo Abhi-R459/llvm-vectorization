@@ -40,12 +40,16 @@ cargo build --release --quiet
   2>"$build_dir/vectorized.remarks"
 
 vector_loops=$(grep -c 'decision=vectorized' "$build_dir/vectorized.remarks")
-[ "$vector_loops" -eq 6 ]
+[ "$vector_loops" -eq 9 ]
 grep -q 'load <4 x float>' "$build_dir/vectorized.ll"
 grep -q 'load <4 x i32>' "$build_dir/vectorized.ll"
 grep -q 'store <2 x i64>' "$build_dir/vectorized.ll"
 grep -q 'zext <4 x i16>' "$build_dir/vectorized.ll"
 grep -q 'select <4 x i1>' "$build_dir/vectorized.ll"
+grep -q 'function=increment_in_place .*decision=vectorized' "$build_dir/vectorized.remarks"
+grep -q 'function=increment_in_place_ne .*decision=vectorized' "$build_dir/vectorized.remarks"
+grep -q 'function=increment_in_place_ult .*decision=vectorized' "$build_dir/vectorized.remarks"
+grep -q 'function=ordered_double_store .*decision=vectorized' "$build_dir/vectorized.remarks"
 
 "$opt" \
   -load-pass-plugin="$plugin" \
@@ -66,6 +70,12 @@ grep -q 'reason=disabled-by-loop-metadata' "$build_dir/rejected.remarks"
 grep -q 'reason=loop-value-live-out' "$build_dir/rejected.remarks"
 grep -q 'reason=preheader-terminator-must-be-branch' "$build_dir/rejected.remarks"
 grep -q 'reason=affine-offset-overflow' "$build_dir/rejected.remarks"
+grep -q 'reason=latch-condition-must-be-icmp' "$build_dir/rejected.remarks"
+grep -q 'function=raw_recurrence .*reason=loop-carried-memory-dependence' "$build_dir/rejected.remarks"
+grep -q 'function=war_recurrence .*reason=loop-carried-memory-dependence' "$build_dir/rejected.remarks"
+grep -q 'function=shifted_waw_recurrence .*reason=loop-carried-memory-dependence' "$build_dir/rejected.remarks"
+grep -q 'function=induction_next_data_use .*reason=induction-next-has-data-use' "$build_dir/rejected.remarks"
+grep -q 'function=latch_compare_data_use .*reason=latch-compare-has-data-use' "$build_dir/rejected.remarks"
 if grep 'function=optimization_disabled ' "$build_dir/rejected.remarks" >/dev/null; then
   printf '%s\n' 'an optnone function was analyzed' >&2
   exit 1
@@ -77,6 +87,48 @@ fi
   -disable-output tests/fixtures/padded-layout.ll \
   2>"$build_dir/padded-layout.remarks"
 grep -q 'reason=incompatible-target-memory-layout' "$build_dir/padded-layout.remarks"
+
+"$opt" \
+  -load-pass-plugin="$plugin" \
+  -passes='rust-loop-vectorize-report,verify' \
+  -disable-output tests/fixtures/narrow-index-layout.ll \
+  2>"$build_dir/narrow-index-layout.remarks"
+grep -q 'reason=incompatible-target-memory-layout' "$build_dir/narrow-index-layout.remarks"
+
+"$opt" \
+  -load-pass-plugin="$plugin" \
+  -passes='rust-loop-vectorize-report,verify' \
+  -disable-output tests/fixtures/wide-index-layout.ll \
+  2>"$build_dir/wide-index-layout.remarks"
+grep -q 'reason=incompatible-target-memory-layout' "$build_dir/wide-index-layout.remarks"
+
+"$opt" \
+  -load-pass-plugin="$plugin" \
+  -passes='rust-loop-vectorize-conservative-report,verify' \
+  -S tests/fixtures/heuristics.ll \
+  -o "$build_dir/conservative.ll" \
+  2>"$build_dir/conservative.remarks"
+grep -q 'decision=rejected reason=not-profitable' "$build_dir/conservative.remarks"
+if grep -q 'rv.vector.body' "$build_dir/conservative.ll"; then
+  printf '%s\n' 'conservative policy vectorized a below-threshold loop' >&2
+  exit 1
+fi
+
+"$opt" \
+  -load-pass-plugin="$plugin" \
+  -passes='rust-loop-vectorize-aggressive-report,verify' \
+  -disable-output tests/fixtures/heuristics.ll \
+  2>"$build_dir/aggressive.remarks"
+grep -q 'decision=vectorized' "$build_dir/aggressive.remarks"
+
+"$opt" \
+  -load-pass-plugin="$plugin" \
+  -passes='rust-loop-vectorize-force-vf8-report,verify' \
+  -S tests/fixtures/heuristics.ll \
+  -o "$build_dir/forced-vf8.ll" \
+  2>"$build_dir/forced-vf8.remarks"
+grep -q 'decision=vectorized.*vf=8' "$build_dir/forced-vf8.remarks"
+grep -q 'load <8 x i32>' "$build_dir/forced-vf8.ll"
 
 sdk_flags=
 if [ "$(uname -s)" = Darwin ] && command -v xcrun >/dev/null 2>&1; then

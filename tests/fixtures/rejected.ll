@@ -167,6 +167,125 @@ exit:
   ret void
 }
 
+define void @constant_latch_condition(ptr noalias %out) {
+entry:
+  br label %loop
+
+loop:
+  %i = phi i64 [ 0, %entry ], [ %next, %loop ]
+  %out.ptr = getelementptr i32, ptr %out, i64 %i
+  store i32 11, ptr %out.ptr, align 4
+  %next = add i64 %i, 1
+  br i1 true, label %loop, label %exit
+
+exit:
+  ret void
+}
+
+; A value written in iteration i-1 is read in iteration i (true/RAW
+; recurrence), so grouping iterations changes the value observed by the load.
+define void @raw_recurrence(ptr noalias %data, i64 %n) {
+entry:
+  %empty = icmp eq i64 %n, 0
+  br i1 %empty, label %exit, label %loop
+
+loop:
+  %i = phi i64 [ 0, %entry ], [ %next, %loop ]
+  %source.index = sub i64 %i, 1
+  %source.ptr = getelementptr i32, ptr %data, i64 %source.index
+  %value = load i32, ptr %source.ptr, align 4
+  %destination.ptr = getelementptr i32, ptr %data, i64 %i
+  store i32 %value, ptr %destination.ptr, align 4
+  %next = add nuw i64 %i, 1
+  %done = icmp eq i64 %next, %n
+  br i1 %done, label %exit, label %loop
+
+exit:
+  ret void
+}
+
+; Iteration i reads the location overwritten by iteration i+1 (WAR/anti
+; dependence).
+define void @war_recurrence(ptr noalias %data, i64 %n) {
+entry:
+  %empty = icmp eq i64 %n, 0
+  br i1 %empty, label %exit, label %loop
+
+loop:
+  %i = phi i64 [ 0, %entry ], [ %next, %loop ]
+  %source.index = add i64 %i, 1
+  %source.ptr = getelementptr i32, ptr %data, i64 %source.index
+  %value = load i32, ptr %source.ptr, align 4
+  %destination.ptr = getelementptr i32, ptr %data, i64 %i
+  store i32 %value, ptr %destination.ptr, align 4
+  %next = add nuw i64 %i, 1
+  %done = icmp eq i64 %next, %n
+  br i1 %done, label %exit, label %loop
+
+exit:
+  ret void
+}
+
+; The second store of iteration i aliases the first store of iteration i+1.
+define void @shifted_waw_recurrence(ptr noalias %data, i64 %n) {
+entry:
+  %empty = icmp eq i64 %n, 0
+  br i1 %empty, label %exit, label %loop
+
+loop:
+  %i = phi i64 [ 0, %entry ], [ %next, %loop ]
+  %first.ptr = getelementptr i32, ptr %data, i64 %i
+  store i32 1, ptr %first.ptr, align 4
+  %second.index = add i64 %i, 1
+  %second.ptr = getelementptr i32, ptr %data, i64 %second.index
+  store i32 2, ptr %second.ptr, align 4
+  %next = add nuw i64 %i, 1
+  %done = icmp eq i64 %next, %n
+  br i1 %done, label %exit, label %loop
+
+exit:
+  ret void
+}
+
+; The transformer synthesizes its own chunk increment and therefore may not
+; silently discard an ordinary data use of the scalar increment.
+define void @induction_next_data_use(ptr noalias %out, i64 %n) {
+entry:
+  %empty = icmp eq i64 %n, 0
+  br i1 %empty, label %exit, label %loop
+
+loop:
+  %i = phi i64 [ 0, %entry ], [ %next, %loop ]
+  %out.ptr = getelementptr i64, ptr %out, i64 %i
+  %next = add nuw i64 %i, 1
+  store i64 %next, ptr %out.ptr, align 8
+  %done = icmp eq i64 %next, %n
+  br i1 %done, label %exit, label %loop
+
+exit:
+  ret void
+}
+
+; The scalar latch comparison is not part of the widened data graph; an extra
+; data use must therefore be rejected before CFG mutation.
+define void @latch_compare_data_use(ptr noalias %out, i64 %n) {
+entry:
+  %empty = icmp eq i64 %n, 0
+  br i1 %empty, label %exit, label %loop
+
+loop:
+  %i = phi i64 [ 0, %entry ], [ %next, %loop ]
+  %out.ptr = getelementptr i8, ptr %out, i64 %i
+  %next = add nuw i64 %i, 1
+  %done = icmp eq i64 %next, %n
+  %done.byte = zext i1 %done to i8
+  store i8 %done.byte, ptr %out.ptr, align 1
+  br i1 %done, label %exit, label %loop
+
+exit:
+  ret void
+}
+
 !0 = distinct !{!0, !1}
 !1 = !{!"llvm.loop.vectorize.enable", i1 false}
 

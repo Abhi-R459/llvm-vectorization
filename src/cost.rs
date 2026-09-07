@@ -12,7 +12,10 @@ pub(crate) struct Plan {
     pub(crate) vf: u32,
     pub(crate) scalar_cost: u64,
     pub(crate) vector_cost: u64,
-    pub(crate) utilization_x100: u64,
+    /// Fraction of scalar iterations handled by the vector body. This is not
+    /// hardware SIMD occupancy; full-vector execution itself has no masked
+    /// inactive lanes because the remainder stays scalar.
+    pub(crate) vector_coverage_x100: u64,
 }
 
 pub(crate) fn choose_plan(
@@ -53,7 +56,7 @@ pub(crate) fn choose_plan(
         vf: candidate_vf,
         scalar_cost,
         vector_cost,
-        utilization_x100: vector_iterations
+        vector_coverage_x100: vector_iterations
             .saturating_mul(u64::from(candidate_vf))
             .saturating_mul(100)
             / estimated_trip_count,
@@ -83,7 +86,7 @@ mod tests {
         )
         .expect("the representative loop should be profitable");
         assert_eq!(plan.vf, 4);
-        assert_eq!(plan.utilization_x100, 100);
+        assert_eq!(plan.vector_coverage_x100, 100);
         assert!(plan.vector_cost < plan.scalar_cost);
     }
 
@@ -135,5 +138,37 @@ mod tests {
         )
         .expect("a valid forced width should bypass the profitability filter");
         assert_eq!(plan.vf, 4);
+    }
+
+    #[test]
+    fn rounds_non_power_of_two_lane_capacity_down() {
+        let plan = choose_plan(
+            config(Heuristic::Aggressive),
+            24,
+            20,
+            LoopCosts {
+                scalar_iteration: 4,
+                vector_iteration: 4,
+                setup: 0,
+            },
+        )
+        .expect("five physical lanes should select the legal power-of-two VF four");
+        assert_eq!(plan.vf, 4);
+    }
+
+    #[test]
+    fn reports_vector_coverage_separately_from_lane_occupancy() {
+        let plan = choose_plan(
+            config(Heuristic::Aggressive),
+            32,
+            10,
+            LoopCosts {
+                scalar_iteration: 4,
+                vector_iteration: 4,
+                setup: 0,
+            },
+        )
+        .expect("two full vector iterations are profitable");
+        assert_eq!(plan.vector_coverage_x100, 80);
     }
 }

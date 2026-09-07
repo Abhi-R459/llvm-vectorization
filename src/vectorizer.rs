@@ -42,6 +42,7 @@ use crate::config::PassConfig;
 use crate::cost::{LoopCosts, Plan, choose_plan};
 use crate::dependence::{AccessKind, AffineAccess, Dependence, classify};
 use crate::llvm;
+use crate::mark_ir_mutated;
 
 const ESTIMATED_DYNAMIC_TRIP_COUNT: u64 = 64;
 const MAX_BODY_INSTRUCTIONS: usize = 96;
@@ -113,23 +114,15 @@ pub(crate) fn run(module: LLVMModuleRef, config: PassConfig) -> bool {
                     let transform_start = Instant::now();
                     // SAFETY: analysis proved the structural invariants consumed
                     // by the transformer, and all handles belong to `module`.
-                    let transformed = unsafe { transform(module, &candidate, plan) };
+                    unsafe { transform(module, &candidate, plan) };
                     let transform_time = transform_start.elapsed();
-                    changed |= transformed;
+                    changed = true;
                     if config.emit_remarks {
                         report(
                             function,
                             header,
-                            if transformed {
-                                "vectorized"
-                            } else {
-                                "rejected"
-                            },
-                            if transformed {
-                                "legal-and-profitable"
-                            } else {
-                                "ir-generation-failed"
-                            },
+                            "vectorized",
+                            "legal-and-profitable",
                             Some(plan),
                             analysis_time,
                             transform_time,
@@ -304,10 +297,9 @@ fn analyze_candidate(
     };
     let plan = choose_plan(config, widest_element_bits, estimated_trip_count, costs)
         .ok_or(Rejection("not-profitable"))?;
-    if memory
-        .iter()
-        .any(|access| !llvm::vector_memory_layout_is_packed(module, access.element_type, plan.vf))
-    {
+    if memory.iter().any(|access| {
+        !llvm::vector_memory_layout_is_packed(module, access.base, access.element_type, plan.vf)
+    }) {
         return Err(Rejection("incompatible-target-memory-layout"));
     }
 
@@ -495,8 +487,14 @@ fn match_latch(
     true_successor: LLVMBasicBlockRef,
     false_successor: LLVMBasicBlockRef,
 ) -> Result<LLVMValueRef, Rejection> {
-    // SAFETY: branch condition is live.
-    if unsafe { LLVMGetInstructionOpcode(compare) } != LLVMICmp {
+    // A conditional branch may legally use an argument or constant i1. The
+    // opcode query is defined only for instructions, so establish that FFI
+    // precondition before asking whether this is an icmp.
+    // SAFETY: branch condition is a live LLVM value.
+    if unsafe { LLVMIsAInstruction(compare) }.is_null()
+        // SAFETY: the remaining value is an instruction.
+        || unsafe { LLVMGetInstructionOpcode(compare) } != LLVMICmp
+    {
         return Err(Rejection("latch-condition-must-be-icmp"));
     }
     // SAFETY: compare has two operands.
@@ -1076,7 +1074,11 @@ fn constant_unsigned(value: LLVMValueRef) -> Option<u64> {
 }
 
 #[allow(clippy::too_many_lines)]
-unsafe fn transform(module: LLVMModuleRef, candidate: &Candidate, plan: Plan) -> bool {
+unsafe fn transform(module: LLVMModuleRef, candidate: &Candidate, plan: Plan) {
+    // From this point onward an unexpected panic must be fail-stop: the FFI
+    // boundary cannot truthfully report `PreservedAnalyses::all()` after a
+    // partial CFG rewrite.
+    mark_ir_mutated();
     // SAFETY: module is live.
     let context = unsafe { LLVMGetModuleContext(module) };
     let builder = Builder::new(context);
@@ -1193,7 +1195,7 @@ unsafe fn transform(module: LLVMModuleRef, candidate: &Candidate, plan: Plan) ->
                 let Ok((base, offset, _, element_type)) =
                     analyze_gep(instruction, candidate.induction, candidate.header)
                 else {
-                    return false;
+                    lowering_invariant_failed("GEP no longer matches the analyzed recipe");
                 };
                 unsafe {
                     build_vector_gep(
@@ -1210,7 +1212,7 @@ unsafe fn transform(module: LLVMModuleRef, candidate: &Candidate, plan: Plan) ->
                 // SAFETY: load pointer is operand 0.
                 let old_pointer = unsafe { LLVMGetOperand(instruction, 0) };
                 let Some(&pointer) = values.get(&llvm::value_key(old_pointer)) else {
-                    return false;
+                    lowering_invariant_failed("load pointer was not widened in SSA order");
                 };
                 // SAFETY: load result type is the scalar element type.
                 let vector_type = unsafe { LLVMVectorType(LLVMTypeOf(instruction), plan.vf) };
@@ -1237,10 +1239,10 @@ unsafe fn transform(module: LLVMModuleRef, candidate: &Candidate, plan: Plan) ->
                         &mut splats,
                     )
                 }) else {
-                    return false;
+                    lowering_invariant_failed("store value was not widenable after preflight");
                 };
                 let Some(&pointer) = values.get(&llvm::value_key(old_pointer)) else {
-                    return false;
+                    lowering_invariant_failed("store pointer was not widened in SSA order");
                 };
                 // SAFETY: pointer names VF contiguous elements and value is a vector.
                 let store = unsafe { LLVMBuildStore(builder.raw(), value, pointer) };
@@ -1260,11 +1262,11 @@ unsafe fn transform(module: LLVMModuleRef, candidate: &Candidate, plan: Plan) ->
                         &mut splats,
                     )
                 }) else {
-                    return false;
+                    lowering_invariant_failed("compute node was not widenable after preflight");
                 };
                 value
             }
-            _ => return false,
+            _ => lowering_invariant_failed("unsupported opcode reached lowering"),
         };
         values.insert(llvm::value_key(instruction), widened);
     }
@@ -1337,7 +1339,12 @@ unsafe fn transform(module: LLVMModuleRef, candidate: &Candidate, plan: Plan) ->
             1,
         );
     };
-    true
+}
+
+#[cold]
+#[inline(never)]
+fn lowering_invariant_failed(message: &str) -> ! {
+    panic!("vectorization legality/lowering invariant failed: {message}")
 }
 
 const fn candidate_minimum_trip(_vf: u32, candidate: &Candidate, _plan: Plan) -> u64 {
@@ -1587,15 +1594,17 @@ fn report(
     analysis: Duration,
     transform: Duration,
 ) {
-    let (vf, utilization) = plan.map_or((0, 0), |plan| (plan.vf, plan.utilization_x100));
+    let (vf, vector_coverage, issued_lane_utilization) =
+        plan.map_or((0, 0, 0), |plan| (plan.vf, plan.vector_coverage_x100, 100));
     eprintln!(
-        "rv-vectorize: function={} loop={} decision={} reason={} vf={} estimated_active_lane_utilization={}% analysis_us={:.3} transform_us={:.3}",
+        "rv-vectorize: function={} loop={} decision={} reason={} vf={} estimated_vector_coverage={}% issued_lane_utilization={}% analysis_us={:.3} transform_us={:.3}",
         llvm::value_name(function),
         llvm::block_name(header),
         decision,
         reason,
         vf,
-        utilization,
+        vector_coverage,
+        issued_lane_utilization,
         duration_micros(analysis),
         duration_micros(transform),
     );

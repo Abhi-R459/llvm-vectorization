@@ -138,4 +138,30 @@ mod tests {
         let high = access(1, i64::MAX, AccessKind::Read);
         assert_eq!(classify(low, high), Dependence::Potential);
     }
+
+    #[test]
+    fn independence_answer_has_no_small_integer_counterexample() {
+        for left_coefficient in -3..=3 {
+            for right_coefficient in -3..=3 {
+                for left_offset in -4..=4 {
+                    for right_offset in -4..=4 {
+                        let left = access(left_coefficient, left_offset, AccessKind::Write);
+                        let right = access(right_coefficient, right_offset, AccessKind::Write);
+                        if classify(left, right) != Dependence::Independent {
+                            continue;
+                        }
+                        for left_iteration in -8..=8 {
+                            for right_iteration in -8..=8 {
+                                assert_ne!(
+                                    left_coefficient * left_iteration + left_offset,
+                                    right_coefficient * right_iteration + right_offset,
+                                    "independence counterexample for {left:?} and {right:?}",
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

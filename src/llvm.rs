@@ -18,6 +18,7 @@ unsafe extern "C" {
     fn rv_loop_vectorization_disabled(instruction: *mut c_void) -> bool;
     fn rv_vector_memory_layout_is_packed(
         module: *mut c_void,
+        base_pointer: *mut c_void,
         element_type: *mut c_void,
         vector_factor: u32,
     ) -> bool;
@@ -31,12 +32,20 @@ pub(crate) fn loop_vectorization_disabled(instruction: LLVMValueRef) -> bool {
 
 pub(crate) fn vector_memory_layout_is_packed(
     module: LLVMModuleRef,
+    base_pointer: LLVMValueRef,
     element_type: LLVMTypeRef,
     vector_factor: u32,
 ) -> bool {
     // SAFETY: all handles belong to the live module and the bridge performs a
     // read-only DataLayout query for a fixed vector type.
-    unsafe { rv_vector_memory_layout_is_packed(module.cast(), element_type.cast(), vector_factor) }
+    unsafe {
+        rv_vector_memory_layout_is_packed(
+            module.cast(),
+            base_pointer.cast(),
+            element_type.cast(),
+            vector_factor,
+        )
+    }
 }
 
 pub(crate) unsafe fn wrap_module(module: *mut c_void) -> LLVMModuleRef {
