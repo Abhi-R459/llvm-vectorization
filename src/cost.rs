@@ -25,7 +25,8 @@ pub(crate) fn choose_plan(
         return None;
     }
 
-    let natural_vf = PassConfig::vector_bits().checked_div(element_bits)?.max(1);
+    let available_lanes = PassConfig::vector_bits().checked_div(element_bits)?.max(1);
+    let natural_vf = 1_u32.checked_shl(available_lanes.ilog2()).unwrap_or(1);
     let candidate_vf = config.forced_vf.unwrap_or(natural_vf);
     if candidate_vf < 2 || !candidate_vf.is_power_of_two() || candidate_vf > 64 {
         return None;

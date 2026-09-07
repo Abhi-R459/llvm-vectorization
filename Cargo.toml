@@ -22,7 +22,6 @@ cc = "1.2"
 [profile.release]
 lto = "thin"
 codegen-units = 1
-panic = "abort"
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
@@ -30,4 +29,3 @@ unsafe_op_in_unsafe_fn = "deny"
 [lints.clippy]
 all = "warn"
 pedantic = "warn"
-

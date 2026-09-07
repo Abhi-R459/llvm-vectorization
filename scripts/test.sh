@@ -62,6 +62,21 @@ grep -q 'reason=loop-carried-memory-dependence' "$build_dir/rejected.remarks"
 grep -q 'reason=possible-pointer-alias' "$build_dir/rejected.remarks"
 grep -q 'reason=volatile-or-atomic-memory' "$build_dir/rejected.remarks"
 grep -q 'reason=unsupported-instruction' "$build_dir/rejected.remarks"
+grep -q 'reason=disabled-by-loop-metadata' "$build_dir/rejected.remarks"
+grep -q 'reason=loop-value-live-out' "$build_dir/rejected.remarks"
+grep -q 'reason=preheader-terminator-must-be-branch' "$build_dir/rejected.remarks"
+grep -q 'reason=affine-offset-overflow' "$build_dir/rejected.remarks"
+if grep 'function=optimization_disabled ' "$build_dir/rejected.remarks" >/dev/null; then
+  printf '%s\n' 'an optnone function was analyzed' >&2
+  exit 1
+fi
+
+"$opt" \
+  -load-pass-plugin="$plugin" \
+  -passes='rust-loop-vectorize-report,verify' \
+  -disable-output tests/fixtures/padded-layout.ll \
+  2>"$build_dir/padded-layout.remarks"
+grep -q 'reason=incompatible-target-memory-layout' "$build_dir/padded-layout.remarks"
 
 sdk_flags=
 if [ "$(uname -s)" = Darwin ] && command -v xcrun >/dev/null 2>&1; then
@@ -75,4 +90,3 @@ fi
 "$build_dir/runtime-check"
 
 printf 'verified: %s vectorized loops, conservative bailouts, LLVM IR verifier, runtime tails\n' "$vector_loops"
-

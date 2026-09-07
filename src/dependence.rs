@@ -42,7 +42,9 @@ pub(crate) fn classify(left: AffineAccess, right: AffineAccess) -> Dependence {
         left.coefficient.unsigned_abs(),
         right.coefficient.unsigned_abs(),
     );
-    let constant_delta = right.offset - left.offset;
+    let Some(constant_delta) = right.offset.checked_sub(left.offset) else {
+        return Dependence::Potential;
+    };
     if divisor == 0 {
         return if constant_delta == 0 {
             Dependence::SameIteration
@@ -55,7 +57,9 @@ pub(crate) fn classify(left: AffineAccess, right: AffineAccess) -> Dependence {
     }
 
     if left.coefficient == right.coefficient && left.coefficient != 0 {
-        let numerator = left.offset - right.offset;
+        let Some(numerator) = left.offset.checked_sub(right.offset) else {
+            return Dependence::Potential;
+        };
         if numerator % left.coefficient == 0 {
             let distance = numerator / left.coefficient;
             return if distance == 0 {
@@ -126,5 +130,12 @@ mod tests {
         let left = access(2, 0, AccessKind::Write);
         let right = access(3, 0, AccessKind::Read);
         assert_eq!(classify(left, right), Dependence::Potential);
+    }
+
+    #[test]
+    fn extreme_offsets_remain_conservative_instead_of_wrapping() {
+        let low = access(1, i64::MIN, AccessKind::Write);
+        let high = access(1, i64::MAX, AccessKind::Read);
+        assert_eq!(classify(low, high), Dependence::Potential);
     }
 }

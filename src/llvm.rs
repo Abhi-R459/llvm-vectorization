@@ -10,11 +10,33 @@ use llvm_sys::core::{
     LLVMGetFirstInstruction, LLVMGetNextBasicBlock, LLVMGetNextFunction, LLVMGetNextInstruction,
     LLVMGetValueName2,
 };
-use llvm_sys::prelude::{LLVMBasicBlockRef, LLVMModuleRef, LLVMValueRef};
+use llvm_sys::prelude::{LLVMBasicBlockRef, LLVMModuleRef, LLVMTypeRef, LLVMValueRef};
 
 unsafe extern "C" {
     fn rv_wrap_module(module: *mut c_void) -> LLVMModuleRef;
     fn rv_phi_set_incoming_block(phi: *mut c_void, index: u32, block: *mut c_void);
+    fn rv_loop_vectorization_disabled(instruction: *mut c_void) -> bool;
+    fn rv_vector_memory_layout_is_packed(
+        module: *mut c_void,
+        element_type: *mut c_void,
+        vector_factor: u32,
+    ) -> bool;
+}
+
+pub(crate) fn loop_vectorization_disabled(instruction: LLVMValueRef) -> bool {
+    // SAFETY: the caller supplies a live branch instruction. The bridge only
+    // inspects its loop metadata.
+    unsafe { rv_loop_vectorization_disabled(instruction.cast()) }
+}
+
+pub(crate) fn vector_memory_layout_is_packed(
+    module: LLVMModuleRef,
+    element_type: LLVMTypeRef,
+    vector_factor: u32,
+) -> bool {
+    // SAFETY: all handles belong to the live module and the bridge performs a
+    // read-only DataLayout query for a fixed vector type.
+    unsafe { rv_vector_memory_layout_is_packed(module.cast(), element_type.cast(), vector_factor) }
 }
 
 pub(crate) unsafe fn wrap_module(module: *mut c_void) -> LLVMModuleRef {

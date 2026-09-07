@@ -1,6 +1,10 @@
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/Analysis/LoopInfo.h"
 #include "llvm/IR/BasicBlock.h"
+#include "llvm/IR/Constants.h"
+#include "llvm/IR/DataLayout.h"
+#include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/PassManager.h"
@@ -27,6 +31,45 @@ void rv_phi_set_incoming_block(void *phi, unsigned index, void *block) {
       reinterpret_cast<LLVMValueRef>(phi)));
   node->setIncomingBlock(
       index, llvm::unwrap(reinterpret_cast<LLVMBasicBlockRef>(block)));
+}
+
+bool rv_loop_vectorization_disabled(void *instruction) {
+  auto *terminator = llvm::unwrap<llvm::Instruction>(
+      reinterpret_cast<LLVMValueRef>(instruction));
+  auto *loopID = terminator->getMetadata(llvm::LLVMContext::MD_loop);
+  if (!loopID)
+    return false;
+  auto *option =
+      llvm::findOptionMDForLoopID(loopID, "llvm.loop.vectorize.enable");
+  if (!option || option->getNumOperands() < 2)
+    return false;
+  auto *enabled =
+      llvm::mdconst::dyn_extract<llvm::ConstantInt>(option->getOperand(1));
+  return enabled && enabled->isZero();
+}
+
+bool rv_vector_memory_layout_is_packed(void *module, void *elementType,
+                                       unsigned vectorFactor) {
+  auto *llvmModule = static_cast<llvm::Module *>(module);
+  auto *scalarType = llvm::unwrap(reinterpret_cast<LLVMTypeRef>(elementType));
+  if (!scalarType->isSized() || vectorFactor < 2)
+    return false;
+
+  const auto &layout = llvmModule->getDataLayout();
+  const auto scalarAllocation = layout.getTypeAllocSize(scalarType);
+  const auto scalarStore = layout.getTypeStoreSize(scalarType);
+  const auto vectorStore = layout.getTypeStoreSize(
+      llvm::FixedVectorType::get(scalarType, vectorFactor));
+  if (scalarAllocation.isScalable() || scalarStore.isScalable() ||
+      vectorStore.isScalable())
+    return false;
+
+  // A vector memory operation is equivalent to VF adjacent scalar operations
+  // only when the target layout inserts no per-element allocation padding and
+  // the fixed vector itself stores exactly those VF element strides.
+  return scalarAllocation.getFixedValue() == scalarStore.getFixedValue() &&
+         vectorStore.getFixedValue() ==
+             vectorFactor * scalarAllocation.getFixedValue();
 }
 
 } // extern "C"
@@ -101,4 +144,3 @@ extern "C" void rv_register_pass_builder_callbacks(void *raw_builder) {
         return true;
       });
 }
-

@@ -5,7 +5,6 @@ use std::ffi::c_char;
 use std::time::{Duration, Instant};
 
 use llvm_sys::LLVMIntPredicate::{LLVMIntEQ, LLVMIntNE, LLVMIntUGE, LLVMIntULT};
-use llvm_sys::LLVMOpcode;
 use llvm_sys::LLVMOpcode::{
     LLVMAShr, LLVMAdd, LLVMAddrSpaceCast, LLVMAnd, LLVMBitCast, LLVMBr, LLVMFAdd, LLVMFCmp,
     LLVMFDiv, LLVMFMul, LLVMFNeg, LLVMFPExt, LLVMFPToSI, LLVMFPToUI, LLVMFPTrunc, LLVMFRem,
@@ -37,6 +36,7 @@ use llvm_sys::core::{
 use llvm_sys::prelude::{
     LLVMBasicBlockRef, LLVMBuilderRef, LLVMContextRef, LLVMModuleRef, LLVMTypeRef, LLVMValueRef,
 };
+use llvm_sys::{LLVMAttributeFunctionIndex, LLVMOpcode};
 
 use crate::config::PassConfig;
 use crate::cost::{LoopCosts, Plan, choose_plan};
@@ -99,10 +99,13 @@ pub(crate) fn run(module: LLVMModuleRef, config: PassConfig) -> bool {
     let functions = llvm::functions(module);
 
     for function in functions {
+        if function_has_enum_attribute(function, LLVMAttributeFunctionIndex, b"optnone") {
+            continue;
+        }
         let headers = discover_single_block_loop_headers(function);
         for header in headers {
             let analysis_start = Instant::now();
-            let analysis = analyze_candidate(function, header, config);
+            let analysis = analyze_candidate(module, function, header, config);
             let analysis_time = analysis_start.elapsed();
 
             match analysis {
@@ -173,6 +176,7 @@ fn discover_single_block_loop_headers(function: LLVMValueRef) -> Vec<LLVMBasicBl
 
 #[allow(clippy::too_many_lines)]
 fn analyze_candidate(
+    module: LLVMModuleRef,
     function: LLVMValueRef,
     header: LLVMBasicBlockRef,
     config: PassConfig,
@@ -181,9 +185,13 @@ fn analyze_candidate(
     if body.len() > MAX_BODY_INSTRUCTIONS {
         return Err(Rejection("instruction-budget-exceeded"));
     }
+    validate_no_live_outs(&body, header)?;
 
     // SAFETY: discovery only returns blocks with a conditional branch.
     let terminator = unsafe { LLVMGetBasicBlockTerminator(header) };
+    if llvm::loop_vectorization_disabled(terminator) {
+        return Err(Rejection("disabled-by-loop-metadata"));
+    }
     // SAFETY: the branch has exactly two successors.
     let first_successor = unsafe { LLVMGetSuccessor(terminator, 0) };
     // SAFETY: the branch has exactly two successors.
@@ -210,6 +218,7 @@ fn analyze_candidate(
         first_successor,
         second_successor,
     )?;
+    validate_control_uses(induction, induction_next, latch_compare, terminator)?;
 
     let mut memory = Vec::new();
     let mut address_only = HashSet::new();
@@ -267,6 +276,24 @@ fn analyze_candidate(
         return Err(Rejection("empty-vector-body"));
     }
 
+    let widen_induction = induction_is_data(
+        &body,
+        induction,
+        induction_next,
+        latch_compare,
+        &address_only,
+    );
+    validate_widening_order(
+        &body,
+        header,
+        induction,
+        induction_next,
+        latch_compare,
+        terminator,
+        &address_only,
+        widen_induction,
+    )?;
+
     // SAFETY: trip_count is a live integer value.
     let estimated_trip_count =
         constant_unsigned(trip_count).unwrap_or(ESTIMATED_DYNAMIC_TRIP_COUNT);
@@ -277,13 +304,12 @@ fn analyze_candidate(
     };
     let plan = choose_plan(config, widest_element_bits, estimated_trip_count, costs)
         .ok_or(Rejection("not-profitable"))?;
-    let widen_induction = induction_is_data(
-        &body,
-        induction,
-        induction_next,
-        latch_compare,
-        &address_only,
-    );
+    if memory
+        .iter()
+        .any(|access| !llvm::vector_memory_layout_is_packed(module, access.element_type, plan.vf))
+    {
+        return Err(Rejection("incompatible-target-memory-layout"));
+    }
 
     Ok((
         Candidate {
@@ -325,6 +351,17 @@ fn find_induction(
         if unsafe { LLVMGetInstructionOpcode(instruction) } != LLVMPHI {
             continue;
         }
+        // Restrict the control arithmetic to i64 so every synthesized mask,
+        // threshold, lane offset, and VF increment is representable exactly.
+        // SAFETY: instruction is a live PHI.
+        let induction_type = unsafe { LLVMTypeOf(instruction) };
+        // SAFETY: induction_type is live.
+        if unsafe { LLVMGetTypeKind(induction_type) } != LLVMIntegerTypeKind
+            // SAFETY: the right-hand side runs only for an integer type.
+            || unsafe { LLVMGetIntTypeWidth(induction_type) } != 64
+        {
+            return Err(Rejection("induction-type-must-be-i64"));
+        }
         // SAFETY: instruction is a PHI.
         if unsafe { LLVMCountIncoming(instruction) } != 2 {
             return Err(Rejection("non-canonical-phi"));
@@ -362,6 +399,39 @@ fn find_induction(
     match_found.ok_or(Rejection("missing-canonical-induction"))
 }
 
+fn validate_control_uses(
+    induction: LLVMValueRef,
+    induction_next: LLVMValueRef,
+    latch_compare: LLVMValueRef,
+    terminator: LLVMValueRef,
+) -> Result<(), Rejection> {
+    // The increment is not widened as ordinary data. It may feed only the
+    // induction PHI and latch comparison.
+    // SAFETY: induction_next is live.
+    let mut usage = unsafe { LLVMGetFirstUse(induction_next) };
+    while !usage.is_null() {
+        // SAFETY: usage is live.
+        let user = unsafe { LLVMGetUser(usage) };
+        if user != induction && user != latch_compare {
+            return Err(Rejection("induction-next-has-data-use"));
+        }
+        // SAFETY: usage is live.
+        usage = unsafe { LLVMGetNextUse(usage) };
+    }
+
+    // SAFETY: latch_compare is live.
+    let mut usage = unsafe { LLVMGetFirstUse(latch_compare) };
+    while !usage.is_null() {
+        // SAFETY: usage is live.
+        if unsafe { LLVMGetUser(usage) } != terminator {
+            return Err(Rejection("latch-compare-has-data-use"));
+        }
+        // SAFETY: usage is live.
+        usage = unsafe { LLVMGetNextUse(usage) };
+    }
+    Ok(())
+}
+
 fn is_add_one(value: LLVMValueRef, induction: LLVMValueRef) -> bool {
     // SAFETY: value is live; non-instructions simply do not match LLVMAdd.
     if unsafe { LLVMIsAInstruction(value) }.is_null()
@@ -383,6 +453,19 @@ fn validate_predecessors(
     header: LLVMBasicBlockRef,
     preheader: LLVMBasicBlockRef,
 ) -> Result<u32, Rejection> {
+    // Re-targeting an indirectbr (or another exotic terminator) is not the
+    // same operation as splitting a normal branch edge: its blockaddress may
+    // continue to name the old destination. Keep the supported CFG contract
+    // explicit and mechanically checkable.
+    // SAFETY: preheader is a live basic block.
+    let preheader_terminator = unsafe { LLVMGetBasicBlockTerminator(preheader) };
+    if preheader_terminator.is_null()
+        // SAFETY: the non-null value is a live terminator instruction.
+        || unsafe { LLVMGetInstructionOpcode(preheader_terminator) } != LLVMBr
+    {
+        return Err(Rejection("preheader-terminator-must-be-branch"));
+    }
+
     let mut external_edges = Vec::new();
     for block in llvm::blocks(function) {
         // SAFETY: block is live.
@@ -472,7 +555,7 @@ fn analyze_gep(
     let (offset, index_node) = parse_affine_index(index, induction)?;
     // SAFETY: value is a GEP.
     let element_type = unsafe { LLVMGetGEPSourceElementType(gep) };
-    if !is_supported_scalar_type(element_type) {
+    if !is_supported_memory_type(element_type) {
         return Err(Rejection("unsupported-memory-element-type"));
     }
     Ok((base, offset, index_node, element_type))
@@ -500,14 +583,14 @@ fn parse_affine_index(
     let right = unsafe { LLVMGetOperand(index, 1) };
     if left == induction {
         let constant = constant_signed(right).ok_or(Rejection("non-constant-affine-offset"))?;
-        return Ok((
-            if opcode == LLVMSub {
-                -constant
-            } else {
-                constant
-            },
-            Some(index),
-        ));
+        let offset = if opcode == LLVMSub {
+            constant
+                .checked_neg()
+                .ok_or(Rejection("affine-offset-overflow"))?
+        } else {
+            constant
+        };
+        return Ok((offset, Some(index)));
     }
     if opcode == LLVMAdd && right == induction {
         let constant = constant_signed(left).ok_or(Rejection("non-constant-affine-offset"))?;
@@ -528,13 +611,45 @@ fn validate_gep_uses(gep: LLVMValueRef, header: LLVMBasicBlockRef) -> Result<(),
         // SAFETY: user is live.
         let opcode = unsafe { LLVMGetInstructionOpcode(user) };
         // SAFETY: user is an instruction.
-        if !matches!(opcode, LLVMLoad | LLVMStore)
-            || unsafe { LLVMGetInstructionParent(user) } != header
-        {
+        let is_pointer_operand = match opcode {
+            // SAFETY: a load has a pointer operand at index zero.
+            LLVMLoad => (unsafe { LLVMGetOperand(user, 0) }) == gep,
+            // SAFETY: a store has a pointer operand at index one.
+            LLVMStore => (unsafe { LLVMGetOperand(user, 1) }) == gep,
+            _ => false,
+        };
+        if !is_pointer_operand || unsafe { LLVMGetInstructionParent(user) } != header {
             return Err(Rejection("gep-has-non-memory-use"));
         }
         // SAFETY: usage is live.
         usage = unsafe { LLVMGetNextUse(usage) };
+    }
+    Ok(())
+}
+
+fn validate_no_live_outs(
+    body: &[LLVMValueRef],
+    header: LLVMBasicBlockRef,
+) -> Result<(), Rejection> {
+    for &instruction in body {
+        // SAFETY: instruction is live.
+        let mut usage = unsafe { LLVMGetFirstUse(instruction) };
+        while !usage.is_null() {
+            // SAFETY: usage is live.
+            let user = unsafe { LLVMGetUser(usage) };
+            // Non-instruction users and users outside the loop would no longer
+            // be dominated when the no-remainder vector path bypasses header.
+            // SAFETY: user is a live LLVM value.
+            let user_instruction = unsafe { LLVMIsAInstruction(user) };
+            if user_instruction.is_null()
+                // SAFETY: non-null user_instruction is an instruction.
+                || unsafe { LLVMGetInstructionParent(user_instruction) } != header
+            {
+                return Err(Rejection("loop-value-live-out"));
+            }
+            // SAFETY: usage is live.
+            usage = unsafe { LLVMGetNextUse(usage) };
+        }
     }
     Ok(())
 }
@@ -588,6 +703,75 @@ fn induction_is_data(
             (unsafe { LLVMGetOperand(instruction, index) }) == induction
         })
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_widening_order(
+    body: &[LLVMValueRef],
+    header: LLVMBasicBlockRef,
+    induction: LLVMValueRef,
+    induction_next: LLVMValueRef,
+    latch_compare: LLVMValueRef,
+    terminator: LLVMValueRef,
+    address_only: &HashSet<usize>,
+    widen_induction: bool,
+) -> Result<(), Rejection> {
+    let mut available = HashSet::new();
+    if widen_induction {
+        available.insert(llvm::value_key(induction));
+    }
+
+    for &instruction in body {
+        if instruction == induction
+            || instruction == induction_next
+            || instruction == latch_compare
+            || instruction == terminator
+            || address_only.contains(&llvm::value_key(instruction))
+        {
+            continue;
+        }
+        // SAFETY: instruction is live.
+        let opcode = unsafe { LLVMGetInstructionOpcode(instruction) };
+        match opcode {
+            LLVMGetElementPtr => {}
+            LLVMLoad => {
+                // SAFETY: load has one pointer operand.
+                let pointer = unsafe { LLVMGetOperand(instruction, 0) };
+                if !available.contains(&llvm::value_key(pointer)) {
+                    return Err(Rejection("load-pointer-not-widened"));
+                }
+            }
+            LLVMStore => {
+                // SAFETY: store has value and pointer operands.
+                let value = unsafe { LLVMGetOperand(instruction, 0) };
+                let pointer = unsafe { LLVMGetOperand(instruction, 1) };
+                if !available.contains(&llvm::value_key(pointer))
+                    || (!is_loop_invariant(value, header)
+                        && !available.contains(&llvm::value_key(value)))
+                {
+                    return Err(Rejection("store-input-not-widened"));
+                }
+            }
+            opcode if is_supported_compute(opcode) => {
+                let operand_count = u32::try_from(unsafe { LLVMGetNumOperands(instruction) })
+                    .expect("LLVM operand counts are non-negative");
+                for index in 0..operand_count {
+                    // SAFETY: index is within the operand array.
+                    let operand = unsafe { LLVMGetOperand(instruction, index) };
+                    if !is_loop_invariant(operand, header)
+                        && !available.contains(&llvm::value_key(operand))
+                    {
+                        return Err(Rejection("compute-input-not-widened"));
+                    }
+                }
+            }
+            _ => return Err(Rejection("unsupported-instruction")),
+        }
+        if opcode != LLVMStore {
+            available.insert(llvm::value_key(instruction));
+        }
+    }
+    Ok(())
 }
 
 fn analyze_memory(
@@ -725,17 +909,21 @@ fn argument_is_noalias(function: LLVMValueRef, value: LLVMValueRef) -> bool {
     let mut argument = unsafe { LLVMGetFirstParam(function) };
     while !argument.is_null() {
         if argument == value {
-            let name = b"noalias";
-            // SAFETY: name points to `name.len()` readable bytes.
-            let kind = unsafe { LLVMGetEnumAttributeKindForName(name.as_ptr().cast(), name.len()) };
-            // SAFETY: position denotes this argument in `function`.
-            return !unsafe { LLVMGetEnumAttributeAtIndex(function, position, kind) }.is_null();
+            return function_has_enum_attribute(function, position, b"noalias");
         }
         position += 1;
         // SAFETY: argument came from this function.
         argument = unsafe { LLVMGetNextParam(argument) };
     }
     false
+}
+
+fn function_has_enum_attribute(function: LLVMValueRef, index: u32, name: &[u8]) -> bool {
+    // SAFETY: name points to `name.len()` readable bytes.
+    let kind = unsafe { LLVMGetEnumAttributeKindForName(name.as_ptr().cast(), name.len()) };
+    // SAFETY: index is either LLVM's function index or a validated parameter
+    // position belonging to `function`.
+    !unsafe { LLVMGetEnumAttributeAtIndex(function, index, kind) }.is_null()
 }
 
 fn instruction_width(instruction: LLVMValueRef) -> Result<u32, Rejection> {
@@ -841,6 +1029,22 @@ fn is_supported_scalar_type(value_type: LLVMTypeRef) -> bool {
         unsafe { LLVMGetTypeKind(value_type) },
         LLVMIntegerTypeKind | LLVMHalfTypeKind | LLVMFloatTypeKind | LLVMDoubleTypeKind
     )
+}
+
+fn is_supported_memory_type(value_type: LLVMTypeRef) -> bool {
+    // Packed fixed-vector memory layout matches consecutive scalar layout for
+    // these deliberately supported primitive widths. Odd-width integers (most
+    // importantly i1) are excluded because allocation and packed-vector store
+    // sizes need not have the same stride.
+    // SAFETY: type is live.
+    match unsafe { LLVMGetTypeKind(value_type) } {
+        LLVMIntegerTypeKind => {
+            // SAFETY: value_type is an integer.
+            matches!(unsafe { LLVMGetIntTypeWidth(value_type) }, 8 | 16 | 32 | 64)
+        }
+        LLVMHalfTypeKind | LLVMFloatTypeKind | LLVMDoubleTypeKind => true,
+        _ => false,
+    }
 }
 
 fn is_loop_invariant(value: LLVMValueRef, header: LLVMBasicBlockRef) -> bool {
@@ -1385,7 +1589,7 @@ fn report(
 ) {
     let (vf, utilization) = plan.map_or((0, 0), |plan| (plan.vf, plan.utilization_x100));
     eprintln!(
-        "rv-vectorize: function={} loop={} decision={} reason={} vf={} utilization={}% analysis_us={:.3} transform_us={:.3}",
+        "rv-vectorize: function={} loop={} decision={} reason={} vf={} estimated_active_lane_utilization={}% analysis_us={:.3} transform_us={:.3}",
         llvm::value_name(function),
         llvm::block_name(header),
         decision,
