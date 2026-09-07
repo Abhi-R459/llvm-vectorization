@@ -104,6 +104,21 @@ grep -q 'reason=incompatible-target-memory-layout' "$build_dir/wide-index-layout
 
 "$opt" \
   -load-pass-plugin="$plugin" \
+  -passes='rust-loop-vectorize-report,verify' \
+  -disable-output tests/fixtures/missing-layout.ll \
+  2>"$build_dir/missing-layout.remarks"
+grep -q 'reason=incompatible-target-memory-layout' "$build_dir/missing-layout.remarks"
+
+"$opt" \
+  -load-pass-plugin="$plugin" \
+  -passes='rust-loop-vectorize-report,verify' \
+  -disable-output tests/fixtures/heuristics.ll \
+  2>"$build_dir/balanced-heuristics.remarks"
+grep -q 'function=offset_copy_i32 .*decision=vectorized.*vf=4' \
+  "$build_dir/balanced-heuristics.remarks"
+
+"$opt" \
+  -load-pass-plugin="$plugin" \
   -passes='rust-loop-vectorize-conservative-report,verify' \
   -S tests/fixtures/heuristics.ll \
   -o "$build_dir/conservative.ll" \

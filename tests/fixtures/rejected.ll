@@ -1,4 +1,5 @@
 ; Each loop exercises a distinct conservative bailout.
+target datalayout = "e-p:64:64:64:64-i64:64-n8:16:32:64-S128"
 
 define void @loop_carried(ptr noalias %data, i64 %n) {
 entry:

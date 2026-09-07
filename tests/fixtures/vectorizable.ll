@@ -1,6 +1,7 @@
 ; Canonical loops accepted by rust-loop-vectorizer. The runtime harness calls
 ; every function with trip counts that exercise scalar-only, exact-vector, and
 ; vector-plus-remainder paths.
+target datalayout = "e-p:64:64:64:64-i64:64-n8:16:32:64-S128"
 
 define void @add_f32(ptr noalias %out, ptr noalias %left, ptr noalias %right, i64 %n) {
 entry:

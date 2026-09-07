@@ -60,8 +60,10 @@ pub(crate) fn classify(left: AffineAccess, right: AffineAccess) -> Dependence {
         let Some(numerator) = left.offset.checked_sub(right.offset) else {
             return Dependence::Potential;
         };
-        if numerator % left.coefficient == 0 {
-            let distance = numerator / left.coefficient;
+        if numerator.checked_rem(left.coefficient) == Some(0) {
+            let Some(distance) = numerator.checked_div(left.coefficient) else {
+                return Dependence::Potential;
+            };
             return if distance == 0 {
                 Dependence::SameIteration
             } else {
@@ -137,6 +139,13 @@ mod tests {
         let low = access(1, i64::MIN, AccessKind::Write);
         let high = access(1, i64::MAX, AccessKind::Read);
         assert_eq!(classify(low, high), Dependence::Potential);
+    }
+
+    #[test]
+    fn minimum_value_divided_by_negative_one_remains_conservative() {
+        let left = access(-1, i64::MIN, AccessKind::Write);
+        let right = access(-1, 0, AccessKind::Read);
+        assert_eq!(classify(left, right), Dependence::Potential);
     }
 
     #[test]

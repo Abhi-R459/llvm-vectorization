@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_char;
+use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
 use llvm_sys::LLVMIntPredicate::{LLVMIntEQ, LLVMIntNE, LLVMIntUGE, LLVMIntULT};
@@ -219,11 +220,28 @@ fn analyze_candidate(
     let mut scalar_cost = 0_u64;
     let mut vector_cost = 0_u64;
 
+    // Discover affine index helpers before costing in program order. Their
+    // i64 type describes address arithmetic that the vector loop rebuilds once
+    // per vector iteration; it must not cap the data VF or count as lane-wise
+    // work merely because its defining add appears before its GEP use.
+    for &instruction in &body {
+        // SAFETY: value is an instruction from `body`.
+        if unsafe { LLVMGetInstructionOpcode(instruction) } != LLVMGetElementPtr {
+            continue;
+        }
+        let (_, _, index_node, _) = analyze_gep(instruction, induction, header)?;
+        if let Some(index_node) = index_node {
+            validate_address_index_uses(index_node, header)?;
+            address_only.insert(llvm::value_key(index_node));
+        }
+    }
+
     for &instruction in &body {
         if instruction == induction
             || instruction == induction_next
             || instruction == latch_compare
             || instruction == terminator
+            || address_only.contains(&llvm::value_key(instruction))
         {
             continue;
         }
@@ -231,12 +249,7 @@ fn analyze_candidate(
         let opcode = unsafe { LLVMGetInstructionOpcode(instruction) };
         match opcode {
             LLVMGetElementPtr => {
-                let (base, offset, index_node, element_type) =
-                    analyze_gep(instruction, induction, header)?;
-                if let Some(index_node) = index_node {
-                    validate_address_index_uses(index_node, header)?;
-                    address_only.insert(llvm::value_key(index_node));
-                }
+                let (base, offset, _, element_type) = analyze_gep(instruction, induction, header)?;
                 widest_element_bits = widest_element_bits.max(type_bits(element_type)?);
                 validate_gep_uses(instruction, header)?;
                 let _ = (base, offset); // Recorded when its load/store is visited.
@@ -1598,8 +1611,8 @@ fn report(
         plan.map_or((0, 0, 0), |plan| (plan.vf, plan.vector_coverage_x100, 100));
     eprintln!(
         "rv-vectorize: function={} loop={} decision={} reason={} vf={} estimated_vector_coverage={}% issued_lane_utilization={}% analysis_us={:.3} transform_us={:.3}",
-        llvm::value_name(function),
-        llvm::block_name(header),
+        report_atom(&llvm::value_name(function)),
+        report_atom(&llvm::block_name(header)),
         decision,
         reason,
         vf,
@@ -1612,4 +1625,29 @@ fn report(
 
 fn duration_micros(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1_000_000.0
+}
+
+fn report_atom(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'$') {
+            encoded.push(char::from(byte));
+        } else {
+            write!(encoded, "%{byte:02X}").expect("writing to a String is infallible");
+        }
+    }
+    encoded
+}
+
+#[cfg(test)]
+mod report_tests {
+    use super::report_atom;
+
+    #[test]
+    fn diagnostic_names_are_single_percent_encoded_atoms() {
+        assert_eq!(
+            report_atom("loop with%newline\n"),
+            "loop%20with%25newline%0A"
+        );
+    }
 }

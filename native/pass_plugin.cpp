@@ -59,9 +59,16 @@ bool rv_vector_memory_layout_is_packed(void *module, void *basePointer,
   if (!pointerType || !scalarType->isSized() || vectorFactor < 2)
     return false;
 
+  // DataLayout("") exposes generic fallback values, but those are not a
+  // promise about the target that will eventually lower this module. Refuse
+  // to turn an absent target contract into a memory-equivalence proof.
+  if (llvmModule->getDataLayoutStr().empty())
+    return false;
+
   const auto &layout = llvmModule->getDataLayout();
-  // The affine proof is over the full i64 induction domain. A narrower GEP
-  // index would silently truncate it and introduce modular wraparound aliases.
+  // The affine proof is over the i64 induction's modular domain. A different
+  // GEP index width would truncate or extend before address arithmetic and can
+  // change wrap-boundary adjacency.
   if (layout.getIndexSizeInBits(pointerType->getAddressSpace()) != 64)
     return false;
   const auto scalarAllocation = layout.getTypeAllocSize(scalarType);
