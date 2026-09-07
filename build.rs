@@ -23,7 +23,9 @@ fn main() {
     assert_eq!(
         major,
         Some(21),
-        "rust-loop-vectorizer requires LLVM 21.x, but {llvm_config:?} reports {version:?}"
+        "rust-loop-vectorizer requires LLVM 21.x, but {} reports {}",
+        llvm_config.display(),
+        version.trim(),
     );
 
     let includedir = query(&llvm_config, &["--includedir"]);
@@ -36,7 +38,10 @@ fn main() {
         .file("native/pass_plugin.cpp")
         .include(includedir.trim())
         .flag_if_supported("-std=c++17")
-        .warnings(true);
+        // LLVM's headers intentionally contain unused parameters in template
+        // interfaces. Warnings from our own code remain errors in CI via the
+        // standalone compiler check, but suppress dependency-header noise here.
+        .warnings(false);
 
     for flag in cxxflags.split_whitespace() {
         if flag.starts_with("-D") || flag == "-fno-exceptions" || flag == "-funwind-tables" {
@@ -123,10 +128,11 @@ fn query(llvm_config: &Path, arguments: &[&str]) -> String {
     let output = Command::new(llvm_config)
         .args(arguments)
         .output()
-        .unwrap_or_else(|error| panic!("failed to execute {llvm_config:?}: {error}"));
+        .unwrap_or_else(|error| panic!("failed to execute {}: {error}", llvm_config.display()));
     assert!(
         output.status.success(),
-        "{llvm_config:?} {arguments:?} failed: {}",
+        "{} {arguments:?} failed: {}",
+        llvm_config.display(),
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8(output.stdout)

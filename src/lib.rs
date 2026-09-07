@@ -7,6 +7,8 @@
 mod config;
 mod cost;
 mod dependence;
+mod llvm;
+mod vectorizer;
 
 use std::ffi::{c_char, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -49,8 +51,15 @@ extern "C" fn llvmGetPassPluginInfo() -> PassPluginLibraryInfo {
 }
 
 /// Entry called by the C++ pass adapter. Panics never cross the FFI boundary.
+/// # Safety
+///
+/// `raw_module` must point to a live `llvm::Module` and `raw_config` to a valid
+/// `RVPassConfig` for the complete duration of this call.
 #[unsafe(no_mangle)]
-pub extern "C" fn rv_run_module(raw_module: *mut c_void, raw_config: *const RVPassConfig) -> bool {
+pub unsafe extern "C" fn rv_run_module(
+    raw_module: *mut c_void,
+    raw_config: *const RVPassConfig,
+) -> bool {
     if raw_module.is_null() || raw_config.is_null() {
         return false;
     }
@@ -69,10 +78,11 @@ pub extern "C" fn rv_run_module(raw_module: *mut c_void, raw_config: *const RVPa
     .unwrap_or(false)
 }
 
-fn run_module(_raw_module: *mut c_void, _config: PassConfig) -> bool {
-    // The registration milestone intentionally performs no mutation. The next
-    // milestone wires this entry point to the Rust legality and widening code.
-    false
+fn run_module(raw_module: *mut c_void, config: PassConfig) -> bool {
+    // SAFETY: the C++ adapter passes a live `llvm::Module` for the duration of
+    // this call. The Rust side neither stores it nor takes ownership.
+    let module = unsafe { llvm::wrap_module(raw_module) };
+    vectorizer::run(module, config)
 }
 
 #[cfg(test)]
@@ -83,7 +93,8 @@ mod tests {
     fn ffi_configuration_is_total() {
         for raw in [0, 1, 2, u32::MAX] {
             let config = PassConfig::new(Heuristic::from_ffi(raw), 0, false);
-            assert!(config.vector_bits() >= 128);
+            assert!(PassConfig::vector_bits() >= 128);
+            assert!(!config.emit_remarks);
         }
     }
 }

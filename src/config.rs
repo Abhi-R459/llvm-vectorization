@@ -35,7 +35,7 @@ impl PassConfig {
         }
     }
 
-    pub(crate) const fn vector_bits(self) -> u32 {
+    pub(crate) const fn vector_bits() -> u32 {
         // Fixed 128-bit vectors are the conservative portable baseline for the
         // currently supported AArch64 and SSE-class targets. The policy stays
         // explicit until TargetTransformInfo is bridged into Rust.
@@ -43,6 +43,9 @@ impl PassConfig {
     }
 
     pub(crate) const fn minimum_trip_count(self, vf: u32) -> u64 {
+        if self.forced_vf.is_some() {
+            return vf as u64;
+        }
         match self.heuristic {
             Heuristic::Conservative => 4 * vf as u64,
             Heuristic::Balanced => 2 * vf as u64,

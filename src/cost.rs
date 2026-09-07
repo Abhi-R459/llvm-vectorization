@@ -25,7 +25,7 @@ pub(crate) fn choose_plan(
         return None;
     }
 
-    let natural_vf = config.vector_bits().checked_div(element_bits)?.max(1);
+    let natural_vf = PassConfig::vector_bits().checked_div(element_bits)?.max(1);
     let candidate_vf = config.forced_vf.unwrap_or(natural_vf);
     if candidate_vf < 2 || !candidate_vf.is_power_of_two() || candidate_vf > 64 {
         return None;
@@ -41,8 +41,9 @@ pub(crate) fn choose_plan(
         .setup
         .saturating_add(vector_iterations.saturating_mul(costs.vector_iteration))
         .saturating_add(remainder.saturating_mul(costs.scalar_iteration));
-    let profitable = scalar_cost.saturating_mul(100)
-        >= vector_cost.saturating_mul(config.required_speedup_x100());
+    let profitable = config.forced_vf.is_some()
+        || scalar_cost.saturating_mul(100)
+            >= vector_cost.saturating_mul(config.required_speedup_x100());
     if !profitable {
         return None;
     }
@@ -116,5 +117,22 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn force_width_overrides_profitability_but_not_legality_shape() {
+        let forced = PassConfig::new(Heuristic::Balanced, 4, false);
+        let plan = choose_plan(
+            forced,
+            32,
+            4,
+            LoopCosts {
+                scalar_iteration: 1,
+                vector_iteration: 100,
+                setup: 100,
+            },
+        )
+        .expect("a valid forced width should bypass the profitability filter");
+        assert_eq!(plan.vf, 4);
     }
 }
