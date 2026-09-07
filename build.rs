@@ -9,8 +9,9 @@ fn main() {
 
     let llvm_config = find_llvm_config().unwrap_or_else(|| {
         panic!(
-            "LLVM 21 was not found. Set LLVM_CONFIG_PATH to llvm-config or \
-             LLVM_SYS_211_PREFIX to the LLVM 21 installation prefix."
+            "LLVM 21 was not found. Set LLVM_SYS_211_PREFIX to its installation \
+             prefix or put its bin directory on PATH. LLVM_CONFIG_PATH may \
+             additionally select the exact llvm-config for the C++ bridge."
         )
     });
 
