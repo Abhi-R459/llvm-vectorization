@@ -1,0 +1,104 @@
+#include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/StringRef.h"
+#include "llvm/IR/BasicBlock.h"
+#include "llvm/IR/Instructions.h"
+#include "llvm/IR/Module.h"
+#include "llvm/IR/PassManager.h"
+#include "llvm/Passes/PassBuilder.h"
+
+#include <cstdint>
+
+extern "C" {
+
+struct RVPassConfig {
+  std::uint32_t heuristic;
+  std::uint32_t forced_vf;
+  std::uint32_t emit_remarks;
+};
+
+bool rv_run_module(void *module, const RVPassConfig *config);
+
+void *rv_wrap_module(void *module) {
+  return llvm::wrap(static_cast<llvm::Module *>(module));
+}
+
+void rv_phi_set_incoming_block(void *phi, unsigned index, void *block) {
+  auto *node = llvm::cast<llvm::PHINode>(llvm::unwrap(
+      reinterpret_cast<LLVMValueRef>(phi)));
+  node->setIncomingBlock(
+      index, llvm::unwrap(reinterpret_cast<LLVMBasicBlockRef>(block)));
+}
+
+} // extern "C"
+
+namespace {
+
+class RustLoopVectorizePass
+    : public llvm::PassInfoMixin<RustLoopVectorizePass> {
+public:
+  explicit RustLoopVectorizePass(RVPassConfig config) : Config(config) {}
+
+  llvm::PreservedAnalyses run(llvm::Module &module,
+                              llvm::ModuleAnalysisManager &) {
+    return rv_run_module(&module, &Config)
+               ? llvm::PreservedAnalyses::none()
+               : llvm::PreservedAnalyses::all();
+  }
+
+private:
+  RVPassConfig Config;
+};
+
+bool parsePassName(llvm::StringRef name, RVPassConfig &config) {
+  config = {/* heuristic = balanced */ 1, /* forced_vf = automatic */ 0,
+            /* emit_remarks = false */ 0};
+
+  if (name == "rust-loop-vectorize" ||
+      name == "rust-loop-vectorize-balanced")
+    return true;
+  if (name == "rust-loop-vectorize-report") {
+    config.emit_remarks = 1;
+    return true;
+  }
+  if (name == "rust-loop-vectorize-conservative") {
+    config.heuristic = 0;
+    return true;
+  }
+  if (name == "rust-loop-vectorize-aggressive") {
+    config.heuristic = 2;
+    return true;
+  }
+  if (name == "rust-loop-vectorize-force-vf2") {
+    config.forced_vf = 2;
+    return true;
+  }
+  if (name == "rust-loop-vectorize-force-vf4") {
+    config.forced_vf = 4;
+    return true;
+  }
+  if (name == "rust-loop-vectorize-force-vf8") {
+    config.forced_vf = 8;
+    return true;
+  }
+  if (name == "rust-loop-vectorize-force-vf16") {
+    config.forced_vf = 16;
+    return true;
+  }
+  return false;
+}
+
+} // namespace
+
+extern "C" void rv_register_pass_builder_callbacks(void *raw_builder) {
+  auto *builder = static_cast<llvm::PassBuilder *>(raw_builder);
+  builder->registerPipelineParsingCallback(
+      [](llvm::StringRef name, llvm::ModulePassManager &manager,
+         llvm::ArrayRef<llvm::PassBuilder::PipelineElement>) {
+        RVPassConfig config{};
+        if (!parsePassName(name, config))
+          return false;
+        manager.addPass(RustLoopVectorizePass(config));
+        return true;
+      });
+}
+
