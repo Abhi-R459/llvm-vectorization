@@ -102,6 +102,32 @@ variables are `LLVM_SYS_211_PREFIX`, `LLVM_CONFIG_PATH`, and
 `RV_PLUGIN_PATH`. Fixed `--vf` values bypass profitability but never bypass
 dependence or legality checks.
 
+### Interactive TUI application
+
+The project also includes a full-screen terminal application:
+
+```sh
+make tui
+# or, after cargo build --release:
+target/release/rv-vectorize-tui
+```
+
+The TUI starts with the positive fixture and `build/tui-vectorized.ll` as its
+default input and output. It provides editable paths, policy and vector-width
+selectors, diagnostics/verification/bitcode toggles, and an on-screen results
+pane containing the vectorizer's per-loop decisions.
+
+Keyboard controls:
+
+| Key | Action |
+|---|---|
+| `Tab`, `Shift-Tab`, `↑`, `↓` | Move between controls. |
+| `←`, `→` | Move within text or change a selector. |
+| `Enter`, `Space` | Toggle a setting or activate the Run button. |
+| `Ctrl-R` | Run from anywhere in the application. |
+| `PageUp`, `PageDown` | Scroll the results pane. |
+| `Esc`, `Ctrl-C` | Exit and restore the terminal. |
+
 ### Direct LLVM invocation
 
 On macOS:
@@ -180,7 +206,8 @@ Run the complete suite:
 ./scripts/test.sh
 ```
 
-It currently covers 21 Rust tests, the CLI application, nine positive LLVM loops, conservative
+It currently covers 27 Rust tests, the CLI and TUI applications, nine positive
+LLVM loops, conservative
 rejection fixtures, policy selection, forced VF, LLVM's verifier, native
 differential execution over boundary trip counts, all three supported latch
 forms, memory-order cases, and guard-page detection of tail over-read/write.
@@ -236,6 +263,7 @@ profitability research; TSVC evaluation; and translation-validation lessons.
 ```text
 native/pass_plugin.cpp       LLVM New PM adapter and narrow C++ bridges
 src/bin/rv-vectorize.rs      CLI driver, discovery, validation, pass execution
+src/bin/rv-vectorize-tui.rs  full-screen interactive terminal application
 src/vectorizer.rs            discovery, legality, planning inputs, IR rewrite
 src/dependence.rs            affine GCD/exact-distance classifier
 src/cost.rs                  VF selection, cost score, vector coverage
