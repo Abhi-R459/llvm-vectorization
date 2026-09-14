@@ -1,7 +1,10 @@
-.PHONY: build test lint differential differential-full benchmark clean
+.PHONY: build cli test lint differential differential-full benchmark clean
 
 build:
 	cargo build --release
+
+cli:
+	cargo build --release --bin rv-vectorize
 
 test:
 	./scripts/test.sh

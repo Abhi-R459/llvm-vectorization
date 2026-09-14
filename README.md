@@ -69,6 +69,41 @@ compatibility boundary.
 cargo build --release
 ```
 
+### CLI application
+
+The release build includes `rv-vectorize`, a command-line application that
+discovers LLVM 21 and the pass plugin, constructs the pass pipeline, and
+propagates LLVM verifier failures:
+
+```sh
+target/release/rv-vectorize --report input.ll -o output.ll
+```
+
+It accepts textual LLVM IR (`.ll`) or bitcode (`.bc`). The default policy is
+`balanced`, the vector factor is selected automatically, textual IR is written
+to stdout when `-o` is omitted, and LLVM verification is enabled. Common
+variants are:
+
+```sh
+# Favor compile time and require stronger estimated profitability.
+target/release/rv-vectorize --policy conservative input.ll -o output.ll
+
+# Force eight lanes after the normal legality checks.
+target/release/rv-vectorize --vf 8 --report input.bc -o output.ll
+
+# Emit bitcode and show the fully resolved LLVM command.
+target/release/rv-vectorize --emit-bitcode input.ll -o output.bc
+target/release/rv-vectorize --dry-run input.ll -o output.ll
+```
+
+Run `rv-vectorize --help` for all options. Use `--llvm-prefix`, `--opt`, and
+`--plugin` for explicit toolchain selection; the corresponding environment
+variables are `LLVM_SYS_211_PREFIX`, `LLVM_CONFIG_PATH`, and
+`RV_PLUGIN_PATH`. Fixed `--vf` values bypass profitability but never bypass
+dependence or legality checks.
+
+### Direct LLVM invocation
+
 On macOS:
 
 ```sh
@@ -145,7 +180,7 @@ Run the complete suite:
 ./scripts/test.sh
 ```
 
-It currently covers 16 Rust tests, nine positive LLVM loops, conservative
+It currently covers 21 Rust tests, the CLI application, nine positive LLVM loops, conservative
 rejection fixtures, policy selection, forced VF, LLVM's verifier, native
 differential execution over boundary trip counts, all three supported latch
 forms, memory-order cases, and guard-page detection of tail over-read/write.
@@ -200,6 +235,7 @@ profitability research; TSVC evaluation; and translation-validation lessons.
 
 ```text
 native/pass_plugin.cpp       LLVM New PM adapter and narrow C++ bridges
+src/bin/rv-vectorize.rs      CLI driver, discovery, validation, pass execution
 src/vectorizer.rs            discovery, legality, planning inputs, IR rewrite
 src/dependence.rs            affine GCD/exact-distance classifier
 src/cost.rs                  VF selection, cost score, vector coverage

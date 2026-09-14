@@ -145,6 +145,14 @@ grep -q 'decision=vectorized' "$build_dir/aggressive.remarks"
 grep -q 'decision=vectorized.*vf=8' "$build_dir/forced-vf8.remarks"
 grep -q 'load <8 x i32>' "$build_dir/forced-vf8.ll"
 
+cli="$repo_dir/target/release/rv-vectorize"
+"$cli" --opt "$opt" --plugin "$plugin" --report tests/fixtures/vectorizable.ll -o "$build_dir/cli-vectorized.ll" 2>"$build_dir/cli-vectorized.remarks"
+grep -q 'load <4 x float>' "$build_dir/cli-vectorized.ll"
+grep -q 'decision=vectorized' "$build_dir/cli-vectorized.remarks"
+
+"$cli" --opt "$opt" --plugin "$plugin" --vf 8 tests/fixtures/heuristics.ll -o "$build_dir/cli-forced-vf8.ll"
+grep -q 'load <8 x i32>' "$build_dir/cli-forced-vf8.ll"
+
 sdk_flags=
 if [ "$(uname -s)" = Darwin ] && command -v xcrun >/dev/null 2>&1; then
   sdk_path=$(xcrun --show-sdk-path)
@@ -169,4 +177,4 @@ llvm_cxxflags=$("$llvm_prefix/bin/llvm-config" --cxxflags)
   -o "$build_dir/runtime-check"
 "$build_dir/runtime-check"
 
-printf 'verified: %s vectorized loops, conservative bailouts, LLVM IR verifier, runtime tails\n' "$vector_loops"
+printf 'verified: %s vectorized loops, CLI, conservative bailouts, LLVM IR verifier, runtime tails\n' "$vector_loops"
