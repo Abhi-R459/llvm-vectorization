@@ -9,16 +9,16 @@ use std::thread;
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 use similar::{DiffOp, TextDiff};
 
 const POLICIES: [&str; 3] = ["balanced", "conservative", "aggressive"];
 const VECTOR_WIDTHS: [&str; 5] = ["auto", "2", "4", "8", "16"];
-const FIELD_COUNT: usize = 8;
+const FIELD_COUNT: usize = 9;
 const HISTORY_CAP: usize = 8;
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const TICK: Duration = Duration::from_millis(80);
@@ -335,6 +335,7 @@ impl App {
                 }
             }
             KeyCode::Enter if self.focused == 7 => self.execute(),
+            KeyCode::Enter if self.focused == 8 => self.toggle_diff_view(),
             KeyCode::Char(' ') | KeyCode::Enter if (4..=6).contains(&self.focused) => {
                 self.toggle_selected();
             }
@@ -741,15 +742,87 @@ fn field_line<'a>(label: &'a str, value: &'a str, selected: bool) -> Line<'a> {
 }
 
 fn toggle_line(label: &'static str, enabled: bool, selected: bool) -> Line<'static> {
-    field_line(
-        label,
-        if enabled {
-            "[x] enabled"
-        } else {
-            "[ ] disabled"
-        },
-        selected,
-    )
+    let (marker, marker_color) = if enabled {
+        ("● On ", SUCCESS)
+    } else {
+        ("○ Off", MUTED)
+    };
+    let bracket_color = if selected { ACCENT } else { ACCENT_DIM };
+    let pill_style = if selected {
+        Style::default()
+            .fg(INK)
+            .bg(ACCENT)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(marker_color)
+    };
+    Line::from(vec![
+        Span::styled(format!("{label:<12}"), Style::default().fg(MUTED)),
+        Span::styled("[ ", Style::default().fg(bracket_color)),
+        Span::styled(marker, pill_style),
+        Span::styled(" ]", Style::default().fg(bracket_color)),
+    ])
+}
+
+/// A row of options rendered like a segmented control (all choices
+/// visible at once, the active one filled in), rather than hiding every
+/// option behind a single cycling value. Takes its own line below a
+/// `label_line`, so it has the panel's full width to work with instead
+/// of competing with a label prefix.
+fn segmented_line<'a>(options: &'a [&'a str], current: usize, selected: bool) -> Line<'a> {
+    let mut spans = vec![Span::raw("  ")];
+    for (index, option) in options.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled("│", Style::default().fg(ACCENT_DIM)));
+        }
+        let is_current = index == current;
+        let style = match (is_current, selected) {
+            (true, true) => Style::default()
+                .fg(INK)
+                .bg(ACCENT)
+                .add_modifier(Modifier::BOLD),
+            (true, false) => Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            (false, _) => Style::default().fg(MUTED),
+        };
+        spans.push(Span::styled(format!(" {option} "), style));
+    }
+    Line::from(spans)
+}
+
+fn label_line(label: &'static str) -> Line<'static> {
+    Line::styled(label, Style::default().fg(MUTED))
+}
+
+/// Render a real bordered button widget (not just inline text) — a
+/// rounded box that fills solid with the accent color while focused, and
+/// dims down when its action isn't currently available.
+fn draw_button(frame: &mut Frame, area: Rect, icon: &str, label: &str, selected: bool, enabled: bool) {
+    let block = if selected && enabled {
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(ACCENT))
+            .style(Style::default().bg(ACCENT))
+    } else {
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(ACCENT_DIM))
+    };
+    let text_style = if selected && enabled {
+        Style::default().fg(INK).add_modifier(Modifier::BOLD)
+    } else if enabled {
+        Style::default().fg(TEXT).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(MUTED)
+    };
+    let button = Paragraph::new(Line::from(Span::styled(
+        format!("{icon} {label}"),
+        text_style,
+    )))
+    .alignment(Alignment::Center)
+    .block(block);
+    frame.render_widget(button, area);
 }
 
 /// Render one transcript entry as a few chat-like lines: the invoked
@@ -817,34 +890,67 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(header, area);
 }
 
-fn draw_config(frame: &mut Frame, app: &App, form_area: Rect, transcript_area: Rect) {
+fn draw_config(frame: &mut Frame, app: &App, form_area: Rect, transcript_area: Rect) -> Rect {
+    let config_block = Block::default()
+        .title(" Configuration ")
+        .title_style(Style::default().fg(TEXT).add_modifier(Modifier::BOLD))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(ACCENT_DIM))
+        .padding(Padding::new(1, 1, 0, 0));
+    let inner = config_block.inner(form_area);
+    frame.render_widget(config_block, form_area);
+
+    let [fields_area, buttons_area] =
+        Layout::vertical([Constraint::Length(10), Constraint::Min(7)]).areas(inner);
+
     let lines = vec![
         field_line("Input", &app.input.value, app.focused == 0),
         field_line("Output", &app.output.value, app.focused == 1),
         Line::raw(""),
-        field_line("Policy", POLICIES[app.policy], app.focused == 2),
-        field_line(
-            "Vector width",
-            VECTOR_WIDTHS[app.vector_width],
-            app.focused == 3,
-        ),
+        label_line("Policy"),
+        segmented_line(&POLICIES, app.policy, app.focused == 2),
+        label_line("Vector width"),
+        segmented_line(&VECTOR_WIDTHS, app.vector_width, app.focused == 3),
         toggle_line("Report", app.report, app.focused == 4),
         toggle_line("Verify", app.verify, app.focused == 5),
         toggle_line("Bitcode", app.emit_bitcode, app.focused == 6),
-        Line::raw(""),
-        field_line("Action", "[ Run vectorizer ]", app.focused == 7),
     ];
-    let form = Paragraph::new(lines)
-        .block(
-            Block::default()
-                .title(" Configuration ")
-                .title_style(Style::default().fg(TEXT).add_modifier(Modifier::BOLD))
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(ACCENT_DIM)),
-        )
-        .wrap(Wrap { trim: false });
-    frame.render_widget(form, form_area);
+    // Deliberately not wrapped: every entry above is exactly one row, and
+    // draw_cursor()/the field indices below assume that row == field
+    // index for the text fields. Wrapping a too-long value would push
+    // every row after it down and misalign both the cursor and the
+    // lower toggles, so a too-long value is clipped instead.
+    let fields = Paragraph::new(lines);
+    frame.render_widget(fields, fields_area);
+
+    let [run_area, _gap, diff_area] = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Length(1),
+        Constraint::Length(3),
+    ])
+    .areas(buttons_area);
+    draw_button(
+        frame,
+        run_area,
+        "▶",
+        "Run vectorizer",
+        app.focused == 7,
+        true,
+    );
+    let diff_label = if app.view == ViewMode::Diff {
+        "Hide diff"
+    } else {
+        "View diff"
+    };
+    draw_button(
+        frame,
+        diff_area,
+        "▤",
+        diff_label,
+        app.focused == 8,
+        app.diff_labels.is_some(),
+    );
 
     let border_color = match (app.worker.is_some(), app.history.last()) {
         (true, _) => PENDING,
@@ -874,11 +980,14 @@ fn draw_config(frame: &mut Frame, app: &App, form_area: Rect, transcript_area: R
                 .title_style(Style::default().fg(TEXT).add_modifier(Modifier::BOLD))
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(border_color)),
+                .border_style(Style::default().fg(border_color))
+                .padding(Padding::new(1, 1, 0, 0)),
         )
         .wrap(Wrap { trim: false })
         .scroll((app.transcript_scroll, 0));
     frame.render_widget(transcript, transcript_area);
+
+    fields_area
 }
 
 fn draw_diff(frame: &mut Frame, app: &App, area: Rect) {
@@ -898,7 +1007,8 @@ fn draw_diff(frame: &mut Frame, app: &App, area: Rect) {
                 .title_style(Style::default().fg(TEXT).add_modifier(Modifier::BOLD))
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(FAILURE)),
+                .border_style(Style::default().fg(FAILURE))
+                .padding(Padding::new(1, 1, 0, 0)),
         )
         .wrap(Wrap { trim: false })
         .scroll((app.diff_scroll, 0));
@@ -911,7 +1021,8 @@ fn draw_diff(frame: &mut Frame, app: &App, area: Rect) {
                 .title_style(Style::default().fg(TEXT).add_modifier(Modifier::BOLD))
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(SUCCESS)),
+                .border_style(Style::default().fg(SUCCESS))
+                .padding(Padding::new(1, 1, 0, 0)),
         )
         .wrap(Wrap { trim: false })
         .scroll((app.diff_scroll, 0));
@@ -971,10 +1082,10 @@ fn draw(frame: &mut Frame, app: &App) {
     match app.view {
         ViewMode::Config => {
             let [form_area, transcript_area] =
-                Layout::horizontal([Constraint::Percentage(42), Constraint::Percentage(58)])
+                Layout::horizontal([Constraint::Percentage(46), Constraint::Percentage(54)])
                     .areas(content_area);
-            draw_config(frame, app, form_area, transcript_area);
-            draw_cursor(frame, app, form_area);
+            let fields_area = draw_config(frame, app, form_area, transcript_area);
+            draw_cursor(frame, app, fields_area);
         }
         ViewMode::Diff => draw_diff(frame, app, content_area),
     }
@@ -982,7 +1093,7 @@ fn draw(frame: &mut Frame, app: &App) {
     draw_footer(frame, app, footer_area);
 }
 
-fn draw_cursor(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_cursor(frame: &mut Frame, app: &App, fields_area: Rect) {
     let field = match app.focused {
         0 => &app.input,
         1 => &app.output,
@@ -990,9 +1101,9 @@ fn draw_cursor(frame: &mut Frame, app: &App, area: Rect) {
     };
     let row = u16::try_from(app.focused).unwrap_or_default();
     let cursor = u16::try_from(field.value[..field.cursor].chars().count()).unwrap_or(u16::MAX);
-    let x = area.x.saturating_add(13).saturating_add(cursor);
-    let y = area.y.saturating_add(1).saturating_add(row);
-    if x < area.right().saturating_sub(1) && y < area.bottom().saturating_sub(1) {
+    let x = fields_area.x.saturating_add(12).saturating_add(cursor);
+    let y = fields_area.y.saturating_add(row);
+    if x < fields_area.right() && y < fields_area.bottom() {
         frame.set_cursor_position((x, y));
     }
 }
@@ -1151,6 +1262,20 @@ mod tests {
     }
 
     #[test]
+    fn view_diff_button_only_activates_once_a_diff_exists() {
+        let mut app = App {
+            focused: 8,
+            ..App::default()
+        };
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.view, ViewMode::Config);
+
+        app.diff_labels = Some(("in.ll".to_owned(), "out.ll".to_owned()));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.view, ViewMode::Diff);
+    }
+
+    #[test]
     fn renders_at_typical_terminal_size() {
         let backend = TestBackend::new(120, 32);
         let mut terminal = Terminal::new(backend).expect("test terminal");
@@ -1163,6 +1288,14 @@ mod tests {
         assert!(rendered.contains("Configuration"));
         assert!(rendered.contains("Session"));
         assert!(rendered.contains("No runs yet"));
+        // The CTA controls render as their own boxed buttons now, not
+        // plain "[ Run vectorizer ]" text inside the form list.
+        assert!(rendered.contains("Run vectorizer"));
+        assert!(rendered.contains("View diff"));
+        // Policy is a segmented control showing every option at once.
+        assert!(rendered.contains("balanced"));
+        assert!(rendered.contains("conservative"));
+        assert!(rendered.contains("aggressive"));
     }
 
     #[test]
