@@ -17,6 +17,7 @@ crate-type = ["cdylib", "rlib"]
 crossterm = "0.28.1"
 llvm-sys = { version = "=211.0.0", features = ["no-llvm-linking"] }
 ratatui = "0.29.0"
+similar = "2.6"
 
 [build-dependencies]
 cc = "1.2"
