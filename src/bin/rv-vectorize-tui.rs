@@ -1,19 +1,38 @@
 use std::env;
+use std::fmt;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::mpsc::{self, Receiver};
+use std::thread;
+use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 
 const POLICIES: [&str; 3] = ["balanced", "conservative", "aggressive"];
 const VECTOR_WIDTHS: [&str; 5] = ["auto", "2", "4", "8", "16"];
 const FIELD_COUNT: usize = 8;
+const HISTORY_CAP: usize = 8;
+const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const TICK: Duration = Duration::from_millis(80);
+
+// A Claude-Code-inspired palette: warm rust/orange accent on a neutral,
+// mostly-monochrome backdrop, rather than the primary cyan/yellow of a
+// typical TUI form.
+const ACCENT: Color = Color::Rgb(0xD9, 0x77, 0x57);
+const ACCENT_DIM: Color = Color::Rgb(0x8A, 0x55, 0x42);
+const INK: Color = Color::Rgb(0x16, 0x14, 0x12);
+const TEXT: Color = Color::Rgb(0xE8, 0xE6, 0xE1);
+const MUTED: Color = Color::Rgb(0x8A, 0x87, 0x82);
+const SUCCESS: Color = Color::Rgb(0x5C, 0xB8, 0x5C);
+const FAILURE: Color = Color::Rgb(0xE0, 0x5A, 0x4E);
+const PENDING: Color = Color::Rgb(0xE0, 0xB0, 0x5A);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct TextField {
@@ -59,14 +78,34 @@ impl TextField {
     }
 }
 
+/// The status of one entry in the run transcript.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RunState {
-    Ready,
+enum EntryStatus {
+    Running,
     Success,
     Failed,
 }
 
-#[derive(Debug)]
+/// One invocation shown in the session transcript, styled like a single
+/// turn of tool use in a coding-agent CLI: the command that ran, then its
+/// outcome and any captured output.
+#[derive(Clone, Debug)]
+struct HistoryEntry {
+    command: String,
+    status: EntryStatus,
+    detail: String,
+}
+
+/// Result of a finished background invocation, sent back over a channel so
+/// the UI thread never blocks on the child process.
+struct WorkerResult {
+    success: bool,
+    code: Option<i32>,
+    stdout: String,
+    stderr: String,
+    spawn_error: Option<String>,
+}
+
 #[allow(clippy::struct_excessive_bools)]
 struct App {
     input: TextField,
@@ -77,10 +116,23 @@ struct App {
     verify: bool,
     emit_bitcode: bool,
     focused: usize,
-    state: RunState,
-    log: String,
-    log_scroll: u16,
+    history: Vec<HistoryEntry>,
+    transcript_scroll: u16,
+    spinner_frame: usize,
+    worker: Option<Receiver<WorkerResult>>,
     quit: bool,
+}
+
+impl fmt::Debug for App {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("App")
+            .field("input", &self.input)
+            .field("output", &self.output)
+            .field("focused", &self.focused)
+            .field("history_len", &self.history.len())
+            .field("running", &self.worker.is_some())
+            .finish()
+    }
 }
 
 impl Default for App {
@@ -94,9 +146,10 @@ impl Default for App {
             verify: true,
             emit_bitcode: false,
             focused: 0,
-            state: RunState::Ready,
-            log: "Configure the pass, then select Run or press Ctrl-R.".to_owned(),
-            log_scroll: 0,
+            history: Vec::new(),
+            transcript_scroll: 0,
+            spinner_frame: 0,
+            worker: None,
             quit: false,
         }
     }
@@ -164,8 +217,8 @@ impl App {
             KeyCode::Esc => self.quit = true,
             KeyCode::Tab | KeyCode::Down => self.next_field(),
             KeyCode::BackTab | KeyCode::Up => self.previous_field(),
-            KeyCode::PageUp => self.log_scroll = self.log_scroll.saturating_sub(5),
-            KeyCode::PageDown => self.log_scroll = self.log_scroll.saturating_add(5),
+            KeyCode::PageUp => self.transcript_scroll = self.transcript_scroll.saturating_sub(5),
+            KeyCode::PageDown => self.transcript_scroll = self.transcript_scroll.saturating_add(5),
             KeyCode::Left => {
                 if let Some(field) = self.selected_text_field() {
                     field.move_left();
@@ -242,21 +295,42 @@ impl App {
         arguments
     }
 
+    /// Push a terminal (non-running) entry straight onto the transcript,
+    /// for validation failures that never reach the child process.
+    fn push_immediate_failure(&mut self, message: impl Into<String>) {
+        self.push_history(HistoryEntry {
+            command: String::new(),
+            status: EntryStatus::Failed,
+            detail: message.into(),
+        });
+    }
+
+    fn push_history(&mut self, entry: HistoryEntry) {
+        self.history.push(entry);
+        while self.history.len() > HISTORY_CAP {
+            self.history.remove(0);
+        }
+        self.transcript_scroll = 0;
+    }
+
+    /// Kick off the configured `rv-vectorize` invocation on a background
+    /// thread so the interface can keep animating a spinner instead of
+    /// freezing until the child process exits.
     fn execute(&mut self) {
-        self.state = RunState::Ready;
-        self.log_scroll = 0;
+        if self.worker.is_some() {
+            // A run is already in flight; ignore the request rather than
+            // starting a second overlapping child process.
+            return;
+        }
         if self.input.value.trim().is_empty() || self.output.value.trim().is_empty() {
-            self.state = RunState::Failed;
-            self.log.clear();
-            self.log.push_str("Input and output paths are required.");
+            self.push_immediate_failure("Input and output paths are required.");
             return;
         }
 
         let executable = match cli_executable() {
             Ok(executable) => executable,
             Err(error) => {
-                self.state = RunState::Failed;
-                self.log = error;
+                self.push_immediate_failure(error);
                 return;
             }
         };
@@ -264,18 +338,18 @@ impl App {
         if let Some(parent) = output_path.parent() {
             if !parent.as_os_str().is_empty() {
                 if let Err(error) = fs::create_dir_all(parent) {
-                    self.state = RunState::Failed;
-                    self.log = format!(
+                    self.push_immediate_failure(format!(
                         "Cannot create output directory {}: {error}",
                         parent.display()
-                    );
+                    ));
                     return;
                 }
             }
         }
+
         let arguments = self.command_arguments();
-        self.log = format!(
-            "Running {} {}",
+        let command_display = format!(
+            "{} {}",
             executable.display(),
             arguments
                 .iter()
@@ -283,38 +357,78 @@ impl App {
                 .collect::<Vec<_>>()
                 .join(" ")
         );
+        self.push_history(HistoryEntry {
+            command: command_display,
+            status: EntryStatus::Running,
+            detail: String::new(),
+        });
 
-        match Command::new(&executable).args(&arguments).output() {
-            Ok(result) => {
-                let stderr = String::from_utf8_lossy(&result.stderr);
-                let stdout = String::from_utf8_lossy(&result.stdout);
-                let mut details = if result.status.success() {
-                    self.state = RunState::Success;
-                    format!("Success: wrote {}.", self.output.value)
-                } else {
-                    self.state = RunState::Failed;
-                    format!(
-                        "Failed: rv-vectorize exited with status {}.",
-                        result
-                            .status
-                            .code()
-                            .map_or_else(|| "signal".to_owned(), |code| code.to_string())
-                    )
-                };
-                if !stderr.trim().is_empty() {
-                    details.push_str("\n\n");
-                    details.push_str(stderr.trim());
-                }
-                if !stdout.trim().is_empty() {
-                    details.push_str("\n\nstdout:\n");
-                    details.push_str(stdout.trim());
-                }
-                self.log = details;
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let outcome = match Command::new(&executable).args(&arguments).output() {
+                Ok(result) => WorkerResult {
+                    success: result.status.success(),
+                    code: result.status.code(),
+                    stdout: String::from_utf8_lossy(&result.stdout).into_owned(),
+                    stderr: String::from_utf8_lossy(&result.stderr).into_owned(),
+                    spawn_error: None,
+                },
+                Err(error) => WorkerResult {
+                    success: false,
+                    code: None,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    spawn_error: Some(error.to_string()),
+                },
+            };
+            let _ = sender.send(outcome);
+        });
+        self.worker = Some(receiver);
+    }
+
+    /// Advance the spinner while a background run is in flight, and check
+    /// whether that run has just finished.
+    fn tick(&mut self) {
+        if self.worker.is_none() {
+            return;
+        }
+        self.spinner_frame = (self.spinner_frame + 1) % SPINNER.len();
+
+        let finished = self
+            .worker
+            .as_ref()
+            .and_then(|receiver| receiver.try_recv().ok());
+        let Some(result) = finished else {
+            return;
+        };
+        self.worker = None;
+        if let Some(entry) = self.history.last_mut() {
+            if let Some(error) = result.spawn_error {
+                entry.status = EntryStatus::Failed;
+                entry.detail = format!("Could not start rv-vectorize: {error}");
+                return;
             }
-            Err(error) => {
-                self.state = RunState::Failed;
-                self.log = format!("Could not start {}: {error}", executable.display());
+            let mut detail = if result.success {
+                entry.status = EntryStatus::Success;
+                "wrote output successfully.".to_owned()
+            } else {
+                entry.status = EntryStatus::Failed;
+                format!(
+                    "rv-vectorize exited with status {}.",
+                    result
+                        .code
+                        .map_or_else(|| "signal".to_owned(), |code| code.to_string())
+                )
+            };
+            if !result.stderr.trim().is_empty() {
+                detail.push('\n');
+                detail.push_str(result.stderr.trim());
             }
+            if !result.stdout.trim().is_empty() {
+                detail.push_str("\n\nstdout:\n");
+                detail.push_str(result.stdout.trim());
+            }
+            entry.detail = detail;
         }
     }
 }
@@ -345,17 +459,17 @@ fn shell_quote(value: &str) -> String {
 fn selected_style(selected: bool) -> Style {
     if selected {
         Style::default()
-            .fg(Color::Black)
-            .bg(Color::Cyan)
+            .fg(INK)
+            .bg(ACCENT)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::White)
+        Style::default().fg(TEXT)
     }
 }
 
 fn field_line<'a>(label: &'a str, value: &'a str, selected: bool) -> Line<'a> {
     Line::from(vec![
-        Span::styled(format!("{label:<12}"), Style::default().fg(Color::Gray)),
+        Span::styled(format!("{label:<12}"), Style::default().fg(MUTED)),
         Span::styled(value, selected_style(selected)),
     ])
 }
@@ -372,6 +486,49 @@ fn toggle_line(label: &'static str, enabled: bool, selected: bool) -> Line<'stat
     )
 }
 
+/// Render one transcript entry as a few chat-like lines: the invoked
+/// command, its status (or a live spinner), and any captured output.
+fn history_lines(entry: &HistoryEntry, spinner: &str) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    if !entry.command.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("❯ ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+            Span::styled(entry.command.clone(), Style::default().fg(MUTED)),
+        ]));
+    }
+    match entry.status {
+        EntryStatus::Running => {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{spinner} "),
+                    Style::default().fg(PENDING).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("running…", Style::default().fg(PENDING)),
+            ]));
+        }
+        EntryStatus::Success => {
+            lines.push(Line::from(Span::styled(
+                "✔ success",
+                Style::default().fg(SUCCESS).add_modifier(Modifier::BOLD),
+            )));
+        }
+        EntryStatus::Failed => {
+            lines.push(Line::from(Span::styled(
+                "✘ failed",
+                Style::default().fg(FAILURE).add_modifier(Modifier::BOLD),
+            )));
+        }
+    }
+    for detail_line in entry.detail.lines() {
+        lines.push(Line::from(Span::styled(
+            format!("  {detail_line}"),
+            Style::default().fg(MUTED),
+        )));
+    }
+    lines.push(Line::raw(""));
+    lines
+}
+
 fn draw(frame: &mut Frame, app: &App) {
     let [header_area, content_area, footer_area] = Layout::vertical([
         Constraint::Length(3),
@@ -379,22 +536,25 @@ fn draw(frame: &mut Frame, app: &App) {
         Constraint::Length(3),
     ])
     .areas(frame.area());
-    let [form_area, log_area] =
-        Layout::horizontal([Constraint::Percentage(47), Constraint::Percentage(53)])
+    let [form_area, transcript_area] =
+        Layout::horizontal([Constraint::Percentage(42), Constraint::Percentage(58)])
             .areas(content_area);
 
-    let title = Paragraph::new(Line::from(vec![
-        Span::styled(" LLVM ", Style::default().fg(Color::Black).bg(Color::Cyan)),
+    let header = Paragraph::new(Line::from(vec![
+        Span::styled("✳ ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
         Span::styled(
-            " Rust Loop Vectorizer ",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
+            "rv-vectorize",
+            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
         ),
-        Span::raw(" interactive compiler pass"),
+        Span::styled("  research LLVM loop vectorizer", Style::default().fg(MUTED)),
     ]))
-    .block(Block::default().borders(Borders::ALL));
-    frame.render_widget(title, header_area);
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(ACCENT_DIM)),
+    );
+    frame.render_widget(header, header_area);
 
     let lines = vec![
         field_line("Input", &app.input.value, app.focused == 0),
@@ -416,49 +576,67 @@ fn draw(frame: &mut Frame, app: &App) {
         .block(
             Block::default()
                 .title(" Configuration ")
+                .title_style(Style::default().fg(TEXT).add_modifier(Modifier::BOLD))
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray)),
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(ACCENT_DIM)),
         )
         .wrap(Wrap { trim: false });
     frame.render_widget(form, form_area);
 
-    let (status, color) = match app.state {
-        RunState::Ready => ("READY", Color::Yellow),
-        RunState::Success => ("SUCCESS", Color::Green),
-        RunState::Failed => ("FAILED", Color::Red),
+    let border_color = match (app.worker.is_some(), app.history.last()) {
+        (true, _) => PENDING,
+        (false, Some(entry)) => match entry.status {
+            EntryStatus::Running => PENDING,
+            EntryStatus::Success => SUCCESS,
+            EntryStatus::Failed => FAILURE,
+        },
+        (false, None) => ACCENT_DIM,
     };
-    let mut log_lines = vec![
-        Line::from(Span::styled(
-            status,
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        )),
-        Line::raw(""),
-    ];
-    log_lines.extend(app.log.lines().map(Line::raw));
-    let log = Paragraph::new(Text::from(log_lines))
+    let spinner = SPINNER[app.spinner_frame];
+    let mut transcript_lines = Vec::new();
+    if app.history.is_empty() {
+        transcript_lines.push(Line::styled(
+            "No runs yet. Configure the pass, then press Enter on Run or Ctrl-R.",
+            Style::default().fg(MUTED),
+        ));
+    } else {
+        for entry in &app.history {
+            transcript_lines.extend(history_lines(entry, spinner));
+        }
+    }
+    let transcript = Paragraph::new(Text::from(transcript_lines))
         .block(
             Block::default()
-                .title(" Results ")
+                .title(" Session ")
+                .title_style(Style::default().fg(TEXT).add_modifier(Modifier::BOLD))
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(color)),
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(border_color)),
         )
         .wrap(Wrap { trim: false })
-        .scroll((app.log_scroll, 0));
-    frame.render_widget(log, log_area);
+        .scroll((app.transcript_scroll, 0));
+    frame.render_widget(transcript, transcript_area);
 
     let footer = Paragraph::new(Line::from(vec![
-        " Tab/↑↓ ".black().on_cyan().bold(),
-        Span::raw(" navigate  "),
-        "←→".cyan().bold(),
-        Span::raw(" change  "),
-        "Enter/Space".cyan().bold(),
-        Span::raw(" select  "),
-        "Ctrl-R".green().bold(),
-        Span::raw(" run  "),
-        "Esc".red().bold(),
-        Span::raw(" quit "),
+        Span::styled(" ❯ ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+        "tab/↑↓".fg(ACCENT).bold(),
+        Span::styled(" next  ", Style::default().fg(MUTED)),
+        "←→".fg(ACCENT).bold(),
+        Span::styled(" change  ", Style::default().fg(MUTED)),
+        "enter/space".fg(ACCENT).bold(),
+        Span::styled(" select  ", Style::default().fg(MUTED)),
+        "ctrl-r".fg(ACCENT).bold(),
+        Span::styled(" run  ", Style::default().fg(MUTED)),
+        "esc".fg(ACCENT).bold(),
+        Span::styled(" quit ", Style::default().fg(MUTED)),
     ]))
-    .block(Block::default().borders(Borders::ALL));
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(ACCENT_DIM)),
+    );
     frame.render_widget(footer, footer_area);
 
     draw_cursor(frame, app, form_area);
@@ -483,9 +661,12 @@ fn run(terminal: &mut DefaultTerminal) -> io::Result<()> {
     let mut app = App::default();
     while !app.quit {
         terminal.draw(|frame| draw(frame, &app))?;
-        if let Event::Key(key) = event::read()? {
-            app.handle_key(key);
+        if event::poll(TICK)? {
+            if let Event::Key(key) = event::read()? {
+                app.handle_key(key);
+            }
         }
+        app.tick();
     }
     Ok(())
 }
@@ -575,6 +756,31 @@ mod tests {
     }
 
     #[test]
+    fn immediate_validation_failure_is_recorded_without_spawning_a_worker() {
+        let mut app = App {
+            input: TextField::new(""),
+            ..App::default()
+        };
+        app.execute();
+        assert!(app.worker.is_none());
+        assert_eq!(app.history.len(), 1);
+        assert_eq!(app.history[0].status, EntryStatus::Failed);
+    }
+
+    #[test]
+    fn history_is_capped() {
+        let mut app = App::default();
+        for _ in 0..(HISTORY_CAP + 3) {
+            app.push_history(HistoryEntry {
+                command: "x".to_owned(),
+                status: EntryStatus::Success,
+                detail: String::new(),
+            });
+        }
+        assert_eq!(app.history.len(), HISTORY_CAP);
+    }
+
+    #[test]
     fn renders_at_typical_terminal_size() {
         let backend = TestBackend::new(120, 32);
         let mut terminal = Terminal::new(backend).expect("test terminal");
@@ -583,8 +789,9 @@ mod tests {
             .expect("render TUI");
         let buffer = terminal.backend().buffer();
         let rendered = format!("{buffer:?}");
-        assert!(rendered.contains("Rust Loop Vectorizer"));
+        assert!(rendered.contains("rv-vectorize"));
         assert!(rendered.contains("Configuration"));
-        assert!(rendered.contains("Results"));
+        assert!(rendered.contains("Session"));
+        assert!(rendered.contains("No runs yet"));
     }
 }
