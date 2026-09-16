@@ -1,19 +1,40 @@
 use std::env;
+use std::fmt;
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::mpsc::{self, Receiver};
+use std::thread;
+use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
+use similar::{DiffOp, TextDiff};
 
 const POLICIES: [&str; 3] = ["balanced", "conservative", "aggressive"];
 const VECTOR_WIDTHS: [&str; 5] = ["auto", "2", "4", "8", "16"];
-const FIELD_COUNT: usize = 8;
+const FIELD_COUNT: usize = 9;
+const HISTORY_CAP: usize = 8;
+const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const TICK: Duration = Duration::from_millis(80);
+
+// A Claude-Code-inspired palette: warm rust/orange accent on a neutral,
+// mostly-monochrome backdrop, rather than the primary cyan/yellow of a
+// typical TUI form.
+const ACCENT: Color = Color::Rgb(0xD9, 0x77, 0x57);
+const ACCENT_DIM: Color = Color::Rgb(0x8A, 0x55, 0x42);
+const INK: Color = Color::Rgb(0x16, 0x14, 0x12);
+const TEXT: Color = Color::Rgb(0xE8, 0xE6, 0xE1);
+const MUTED: Color = Color::Rgb(0x8A, 0x87, 0x82);
+const SUCCESS: Color = Color::Rgb(0x5C, 0xB8, 0x5C);
+const FAILURE: Color = Color::Rgb(0xE0, 0x5A, 0x4E);
+const PENDING: Color = Color::Rgb(0xE0, 0xB0, 0x5A);
+const PENDING_DIM: Color = Color::Rgb(0x6E, 0x56, 0x30);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct TextField {
@@ -59,14 +80,69 @@ impl TextField {
     }
 }
 
+/// The status of one entry in the run transcript.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RunState {
-    Ready,
+enum EntryStatus {
+    Running,
     Success,
     Failed,
 }
 
-#[derive(Debug)]
+/// One invocation shown in the session transcript, styled like a single
+/// turn of tool use in a coding-agent CLI: the command that ran, then its
+/// outcome and any captured output.
+#[derive(Clone, Debug)]
+struct HistoryEntry {
+    command: String,
+    status: EntryStatus,
+    detail: String,
+}
+
+/// Result of a finished background invocation, sent back over a channel so
+/// the UI thread never blocks on the child process.
+struct WorkerResult {
+    success: bool,
+    code: Option<i32>,
+    stdout: String,
+    stderr: String,
+    spawn_error: Option<String>,
+}
+
+/// Which screen is currently shown: the configuration form (with the run
+/// transcript beside it), or the side-by-side before/after diff.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ViewMode {
+    Config,
+    Diff,
+}
+
+/// How a single diff row should be colored, GitHub-review style.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RowKind {
+    Context,
+    Removed,
+    Added,
+    Empty,
+}
+
+/// One aligned row of a side-by-side diff: the original file's line (if
+/// any) paired with the optimized file's line (if any) at the same row.
+#[derive(Clone, Debug)]
+struct DiffRow {
+    left_no: Option<usize>,
+    left_text: String,
+    left_kind: RowKind,
+    right_no: Option<usize>,
+    right_text: String,
+    right_kind: RowKind,
+}
+
+#[derive(Clone, Copy)]
+enum Side {
+    Left,
+    Right,
+}
+
 #[allow(clippy::struct_excessive_bools)]
 struct App {
     input: TextField,
@@ -77,10 +153,31 @@ struct App {
     verify: bool,
     emit_bitcode: bool,
     focused: usize,
-    state: RunState,
-    log: String,
-    log_scroll: u16,
+    history: Vec<HistoryEntry>,
+    transcript_scroll: u16,
+    spinner_frame: usize,
+    tick_count: u64,
+    worker: Option<Receiver<WorkerResult>>,
+    run_input: String,
+    run_output: String,
+    view: ViewMode,
+    diff_rows: Vec<DiffRow>,
+    diff_labels: Option<(String, String)>,
+    diff_scroll: u16,
     quit: bool,
+}
+
+impl fmt::Debug for App {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("App")
+            .field("input", &self.input)
+            .field("output", &self.output)
+            .field("focused", &self.focused)
+            .field("history_len", &self.history.len())
+            .field("running", &self.worker.is_some())
+            .field("view", &self.view)
+            .finish()
+    }
 }
 
 impl Default for App {
@@ -94,9 +191,17 @@ impl Default for App {
             verify: true,
             emit_bitcode: false,
             focused: 0,
-            state: RunState::Ready,
-            log: "Configure the pass, then select Run or press Ctrl-R.".to_owned(),
-            log_scroll: 0,
+            history: Vec::new(),
+            transcript_scroll: 0,
+            spinner_frame: 0,
+            tick_count: 0,
+            worker: None,
+            run_input: String::new(),
+            run_output: String::new(),
+            view: ViewMode::Config,
+            diff_rows: Vec::new(),
+            diff_labels: None,
+            diff_scroll: 0,
             quit: false,
         }
     }
@@ -148,6 +253,18 @@ impl App {
         }
     }
 
+    /// Flip between the configuration screen and the diff screen. A no-op
+    /// until at least one run has produced a diff to show.
+    fn toggle_diff_view(&mut self) {
+        if self.diff_labels.is_none() {
+            return;
+        }
+        self.view = match self.view {
+            ViewMode::Config => ViewMode::Diff,
+            ViewMode::Diff => ViewMode::Config,
+        };
+    }
+
     fn handle_key(&mut self, key: KeyEvent) {
         if key.kind != KeyEventKind::Press {
             return;
@@ -156,6 +273,23 @@ impl App {
             self.quit = true;
             return;
         }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('d') {
+            self.toggle_diff_view();
+            return;
+        }
+
+        if self.view == ViewMode::Diff {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => self.view = ViewMode::Config,
+                KeyCode::Up => self.diff_scroll = self.diff_scroll.saturating_sub(1),
+                KeyCode::Down => self.diff_scroll = self.diff_scroll.saturating_add(1),
+                KeyCode::PageUp => self.diff_scroll = self.diff_scroll.saturating_sub(10),
+                KeyCode::PageDown => self.diff_scroll = self.diff_scroll.saturating_add(10),
+                _ => {}
+            }
+            return;
+        }
+
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('r') {
             self.execute();
             return;
@@ -164,8 +298,8 @@ impl App {
             KeyCode::Esc => self.quit = true,
             KeyCode::Tab | KeyCode::Down => self.next_field(),
             KeyCode::BackTab | KeyCode::Up => self.previous_field(),
-            KeyCode::PageUp => self.log_scroll = self.log_scroll.saturating_sub(5),
-            KeyCode::PageDown => self.log_scroll = self.log_scroll.saturating_add(5),
+            KeyCode::PageUp => self.transcript_scroll = self.transcript_scroll.saturating_sub(5),
+            KeyCode::PageDown => self.transcript_scroll = self.transcript_scroll.saturating_add(5),
             KeyCode::Left => {
                 if let Some(field) = self.selected_text_field() {
                     field.move_left();
@@ -201,6 +335,7 @@ impl App {
                 }
             }
             KeyCode::Enter if self.focused == 7 => self.execute(),
+            KeyCode::Enter if self.focused == 8 => self.toggle_diff_view(),
             KeyCode::Char(' ') | KeyCode::Enter if (4..=6).contains(&self.focused) => {
                 self.toggle_selected();
             }
@@ -242,21 +377,42 @@ impl App {
         arguments
     }
 
+    /// Push a terminal (non-running) entry straight onto the transcript,
+    /// for validation failures that never reach the child process.
+    fn push_immediate_failure(&mut self, message: impl Into<String>) {
+        self.push_history(HistoryEntry {
+            command: String::new(),
+            status: EntryStatus::Failed,
+            detail: message.into(),
+        });
+    }
+
+    fn push_history(&mut self, entry: HistoryEntry) {
+        self.history.push(entry);
+        while self.history.len() > HISTORY_CAP {
+            self.history.remove(0);
+        }
+        self.transcript_scroll = 0;
+    }
+
+    /// Kick off the configured `rv-vectorize` invocation on a background
+    /// thread so the interface can keep animating instead of freezing
+    /// until the child process exits.
     fn execute(&mut self) {
-        self.state = RunState::Ready;
-        self.log_scroll = 0;
+        if self.worker.is_some() {
+            // A run is already in flight; ignore the request rather than
+            // starting a second overlapping child process.
+            return;
+        }
         if self.input.value.trim().is_empty() || self.output.value.trim().is_empty() {
-            self.state = RunState::Failed;
-            self.log.clear();
-            self.log.push_str("Input and output paths are required.");
+            self.push_immediate_failure("Input and output paths are required.");
             return;
         }
 
         let executable = match cli_executable() {
             Ok(executable) => executable,
             Err(error) => {
-                self.state = RunState::Failed;
-                self.log = error;
+                self.push_immediate_failure(error);
                 return;
             }
         };
@@ -264,18 +420,21 @@ impl App {
         if let Some(parent) = output_path.parent() {
             if !parent.as_os_str().is_empty() {
                 if let Err(error) = fs::create_dir_all(parent) {
-                    self.state = RunState::Failed;
-                    self.log = format!(
+                    self.push_immediate_failure(format!(
                         "Cannot create output directory {}: {error}",
                         parent.display()
-                    );
+                    ));
                     return;
                 }
             }
         }
+
+        self.run_input = self.input.value.clone();
+        self.run_output = self.output.value.clone();
+
         let arguments = self.command_arguments();
-        self.log = format!(
-            "Running {} {}",
+        let command_display = format!(
+            "{} {}",
             executable.display(),
             arguments
                 .iter()
@@ -283,39 +442,99 @@ impl App {
                 .collect::<Vec<_>>()
                 .join(" ")
         );
+        self.push_history(HistoryEntry {
+            command: command_display,
+            status: EntryStatus::Running,
+            detail: String::new(),
+        });
 
-        match Command::new(&executable).args(&arguments).output() {
-            Ok(result) => {
-                let stderr = String::from_utf8_lossy(&result.stderr);
-                let stdout = String::from_utf8_lossy(&result.stdout);
-                let mut details = if result.status.success() {
-                    self.state = RunState::Success;
-                    format!("Success: wrote {}.", self.output.value)
-                } else {
-                    self.state = RunState::Failed;
-                    format!(
-                        "Failed: rv-vectorize exited with status {}.",
-                        result
-                            .status
-                            .code()
-                            .map_or_else(|| "signal".to_owned(), |code| code.to_string())
-                    )
-                };
-                if !stderr.trim().is_empty() {
-                    details.push_str("\n\n");
-                    details.push_str(stderr.trim());
-                }
-                if !stdout.trim().is_empty() {
-                    details.push_str("\n\nstdout:\n");
-                    details.push_str(stdout.trim());
-                }
-                self.log = details;
-            }
-            Err(error) => {
-                self.state = RunState::Failed;
-                self.log = format!("Could not start {}: {error}", executable.display());
-            }
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let outcome = match Command::new(&executable).args(&arguments).output() {
+                Ok(result) => WorkerResult {
+                    success: result.status.success(),
+                    code: result.status.code(),
+                    stdout: String::from_utf8_lossy(&result.stdout).into_owned(),
+                    stderr: String::from_utf8_lossy(&result.stderr).into_owned(),
+                    spawn_error: None,
+                },
+                Err(error) => WorkerResult {
+                    success: false,
+                    code: None,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    spawn_error: Some(error.to_string()),
+                },
+            };
+            let _ = sender.send(outcome);
+        });
+        self.worker = Some(receiver);
+    }
+
+    /// Advance the animations every frame, and check whether a background
+    /// run has just finished.
+    fn tick(&mut self) {
+        self.tick_count = self.tick_count.wrapping_add(1);
+        if self.worker.is_none() {
+            return;
         }
+        self.spinner_frame = (self.spinner_frame + 1) % SPINNER.len();
+
+        let finished = self
+            .worker
+            .as_ref()
+            .and_then(|receiver| receiver.try_recv().ok());
+        let Some(result) = finished else {
+            return;
+        };
+        self.worker = None;
+        if let Some(entry) = self.history.last_mut() {
+            if let Some(error) = result.spawn_error {
+                entry.status = EntryStatus::Failed;
+                entry.detail = format!("Could not start rv-vectorize: {error}");
+                return;
+            }
+            let mut detail = if result.success {
+                entry.status = EntryStatus::Success;
+                "wrote output successfully.".to_owned()
+            } else {
+                entry.status = EntryStatus::Failed;
+                format!(
+                    "rv-vectorize exited with status {}.",
+                    result
+                        .code
+                        .map_or_else(|| "signal".to_owned(), |code| code.to_string())
+                )
+            };
+            if !result.stderr.trim().is_empty() {
+                detail.push('\n');
+                detail.push_str(result.stderr.trim());
+            }
+            if !result.stdout.trim().is_empty() {
+                detail.push_str("\n\nstdout:\n");
+                detail.push_str(result.stdout.trim());
+            }
+            entry.detail = detail;
+        }
+        if result.success {
+            self.load_diff();
+        }
+    }
+
+    /// Read the input and (now freshly written) output IR back off disk
+    /// and diff them for the side-by-side view. Silently leaves the diff
+    /// empty if either file cannot be read as text (for example, when
+    /// `--emit-bitcode` was used).
+    fn load_diff(&mut self) {
+        let (Ok(original), Ok(optimized)) = (
+            fs::read_to_string(&self.run_input),
+            fs::read_to_string(&self.run_output),
+        ) else {
+            return;
+        };
+        self.diff_rows = build_diff_rows(&original, &optimized);
+        self.diff_labels = Some((self.run_input.clone(), self.run_output.clone()));
+        self.diff_scroll = 0;
     }
 }
 
@@ -342,34 +561,512 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+/// Build the aligned rows of a side-by-side diff from two whole-file
+/// strings, GitHub-review style: unchanged lines stay level on both
+/// sides, and removed/added lines pad the other side with a blank row so
+/// everything stays aligned row-for-row.
+fn build_diff_rows(original: &str, optimized: &str) -> Vec<DiffRow> {
+    let old_lines: Vec<&str> = original.lines().collect();
+    let new_lines: Vec<&str> = optimized.lines().collect();
+    let diff = TextDiff::from_lines(original, optimized);
+    let mut rows = Vec::new();
+
+    for op in diff.ops() {
+        match *op {
+            DiffOp::Equal {
+                old_index,
+                new_index,
+                len,
+            } => {
+                for offset in 0..len {
+                    let text = old_lines.get(old_index + offset).copied().unwrap_or("");
+                    rows.push(DiffRow {
+                        left_no: Some(old_index + offset + 1),
+                        left_text: text.to_owned(),
+                        left_kind: RowKind::Context,
+                        right_no: Some(new_index + offset + 1),
+                        right_text: text.to_owned(),
+                        right_kind: RowKind::Context,
+                    });
+                }
+            }
+            DiffOp::Delete {
+                old_index, old_len, ..
+            } => {
+                for offset in 0..old_len {
+                    rows.push(DiffRow {
+                        left_no: Some(old_index + offset + 1),
+                        left_text: old_lines.get(old_index + offset).copied().unwrap_or("").to_owned(),
+                        left_kind: RowKind::Removed,
+                        right_no: None,
+                        right_text: String::new(),
+                        right_kind: RowKind::Empty,
+                    });
+                }
+            }
+            DiffOp::Insert {
+                new_index, new_len, ..
+            } => {
+                for offset in 0..new_len {
+                    rows.push(DiffRow {
+                        left_no: None,
+                        left_text: String::new(),
+                        left_kind: RowKind::Empty,
+                        right_no: Some(new_index + offset + 1),
+                        right_text: new_lines.get(new_index + offset).copied().unwrap_or("").to_owned(),
+                        right_kind: RowKind::Added,
+                    });
+                }
+            }
+            DiffOp::Replace {
+                old_index,
+                old_len,
+                new_index,
+                new_len,
+            } => {
+                let rows_needed = old_len.max(new_len);
+                for offset in 0..rows_needed {
+                    let (left_no, left_text, left_kind) = if offset < old_len {
+                        (
+                            Some(old_index + offset + 1),
+                            old_lines.get(old_index + offset).copied().unwrap_or("").to_owned(),
+                            RowKind::Removed,
+                        )
+                    } else {
+                        (None, String::new(), RowKind::Empty)
+                    };
+                    let (right_no, right_text, right_kind) = if offset < new_len {
+                        (
+                            Some(new_index + offset + 1),
+                            new_lines.get(new_index + offset).copied().unwrap_or("").to_owned(),
+                            RowKind::Added,
+                        )
+                    } else {
+                        (None, String::new(), RowKind::Empty)
+                    };
+                    rows.push(DiffRow {
+                        left_no,
+                        left_text,
+                        left_kind,
+                        right_no,
+                        right_text,
+                        right_kind,
+                    });
+                }
+            }
+        }
+    }
+    rows
+}
+
+fn diff_pane_lines(rows: &[DiffRow], side: Side) -> Vec<Line<'static>> {
+    rows.iter()
+        .map(|row| {
+            let (number, text, kind) = match side {
+                Side::Left => (row.left_no, &row.left_text, row.left_kind),
+                Side::Right => (row.right_no, &row.right_text, row.right_kind),
+            };
+            let (marker, color) = match kind {
+                RowKind::Context => (" ", TEXT),
+                RowKind::Removed => ("-", FAILURE),
+                RowKind::Added => ("+", SUCCESS),
+                RowKind::Empty => (" ", MUTED),
+            };
+            let gutter = number.map_or_else(|| "    ".to_owned(), |n| format!("{n:>4}"));
+            Line::from(vec![
+                Span::styled(format!("{gutter} {marker} "), Style::default().fg(MUTED)),
+                Span::styled(text.clone(), Style::default().fg(color)),
+            ])
+        })
+        .collect()
+}
+
+fn file_label(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map_or_else(|| path.to_owned(), ToOwned::to_owned)
+}
+
+/// Linearly interpolate between two RGB colors; falls back to `a` for any
+/// non-RGB color (every palette constant above is RGB, so this only ever
+/// takes the fast path in practice).
+fn lerp_color(a: Color, b: Color, t: f32) -> Color {
+    let Color::Rgb(ar, ag, ab) = a else { return a };
+    let Color::Rgb(br, bg, bb) = b else { return a };
+    let t = t.clamp(0.0, 1.0);
+    let mix = |from: u8, to: u8| (f32::from(from) + (f32::from(to) - f32::from(from)) * t) as u8;
+    Color::Rgb(mix(ar, br), mix(ag, bg), mix(ab, bb))
+}
+
+/// A moving highlight sweeping across `text`, the same shimmering-text
+/// effect Claude's own CLI uses while it's working, built from a per-
+/// character sine wave so it needs no extra crate or animation state.
+fn shimmer_spans(text: &str, tick: u64, dim: Color, bright: Color) -> Vec<Span<'static>> {
+    text.chars()
+        .enumerate()
+        .map(|(index, character)| {
+            let phase = (index as f32).mul_add(0.6, -(tick as f32) * 0.35);
+            let brightness = phase.sin().mul_add(0.5, 0.5);
+            Span::styled(
+                character.to_string(),
+                Style::default().fg(lerp_color(dim, bright, brightness)),
+            )
+        })
+        .collect()
+}
+
+/// A slow "breathing" pulse between two colors, used on the header icon
+/// so the interface feels alive even when idle.
+fn breathing_color(tick: u64, dim: Color, bright: Color) -> Color {
+    let brightness = ((tick as f32) * 0.08).sin().mul_add(0.5, 0.5);
+    lerp_color(dim, bright, brightness)
+}
+
 fn selected_style(selected: bool) -> Style {
     if selected {
         Style::default()
-            .fg(Color::Black)
-            .bg(Color::Cyan)
+            .fg(INK)
+            .bg(ACCENT)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::White)
+        Style::default().fg(TEXT)
     }
 }
 
 fn field_line<'a>(label: &'a str, value: &'a str, selected: bool) -> Line<'a> {
     Line::from(vec![
-        Span::styled(format!("{label:<12}"), Style::default().fg(Color::Gray)),
+        Span::styled(format!("{label:<12}"), Style::default().fg(MUTED)),
         Span::styled(value, selected_style(selected)),
     ])
 }
 
 fn toggle_line(label: &'static str, enabled: bool, selected: bool) -> Line<'static> {
-    field_line(
-        label,
-        if enabled {
-            "[x] enabled"
-        } else {
-            "[ ] disabled"
+    let (marker, marker_color) = if enabled {
+        ("● On ", SUCCESS)
+    } else {
+        ("○ Off", MUTED)
+    };
+    let bracket_color = if selected { ACCENT } else { ACCENT_DIM };
+    let pill_style = if selected {
+        Style::default()
+            .fg(INK)
+            .bg(ACCENT)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(marker_color)
+    };
+    Line::from(vec![
+        Span::styled(format!("{label:<12}"), Style::default().fg(MUTED)),
+        Span::styled("[ ", Style::default().fg(bracket_color)),
+        Span::styled(marker, pill_style),
+        Span::styled(" ]", Style::default().fg(bracket_color)),
+    ])
+}
+
+/// A row of options rendered like a segmented control (all choices
+/// visible at once, the active one filled in), rather than hiding every
+/// option behind a single cycling value. Takes its own line below a
+/// `label_line`, so it has the panel's full width to work with instead
+/// of competing with a label prefix.
+fn segmented_line<'a>(options: &'a [&'a str], current: usize, selected: bool) -> Line<'a> {
+    let mut spans = vec![Span::raw("  ")];
+    for (index, option) in options.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled("│", Style::default().fg(ACCENT_DIM)));
+        }
+        let is_current = index == current;
+        let style = match (is_current, selected) {
+            (true, true) => Style::default()
+                .fg(INK)
+                .bg(ACCENT)
+                .add_modifier(Modifier::BOLD),
+            (true, false) => Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            (false, _) => Style::default().fg(MUTED),
+        };
+        spans.push(Span::styled(format!(" {option} "), style));
+    }
+    Line::from(spans)
+}
+
+fn label_line(label: &'static str) -> Line<'static> {
+    Line::styled(label, Style::default().fg(MUTED))
+}
+
+/// Render a real bordered button widget (not just inline text) — a
+/// rounded box that fills solid with the accent color while focused, and
+/// dims down when its action isn't currently available.
+fn draw_button(frame: &mut Frame, area: Rect, icon: &str, label: &str, selected: bool, enabled: bool) {
+    let block = if selected && enabled {
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(ACCENT))
+            .style(Style::default().bg(ACCENT))
+    } else {
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(ACCENT_DIM))
+    };
+    let text_style = if selected && enabled {
+        Style::default().fg(INK).add_modifier(Modifier::BOLD)
+    } else if enabled {
+        Style::default().fg(TEXT).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(MUTED)
+    };
+    let button = Paragraph::new(Line::from(Span::styled(
+        format!("{icon} {label}"),
+        text_style,
+    )))
+    .alignment(Alignment::Center)
+    .block(block);
+    frame.render_widget(button, area);
+}
+
+/// Render one transcript entry as a few chat-like lines: the invoked
+/// command, its status (or a live spinner and shimmer), and any captured
+/// output.
+fn history_lines(entry: &HistoryEntry, spinner: &str, tick: u64) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    if !entry.command.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled(
+                "❯ ",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(entry.command.clone(), Style::default().fg(MUTED)),
+        ]));
+    }
+    match entry.status {
+        EntryStatus::Running => {
+            let mut spans = vec![Span::styled(
+                format!("{spinner} "),
+                Style::default().fg(PENDING).add_modifier(Modifier::BOLD),
+            )];
+            spans.extend(shimmer_spans("running…", tick, PENDING_DIM, PENDING));
+            lines.push(Line::from(spans));
+        }
+        EntryStatus::Success => {
+            lines.push(Line::from(Span::styled(
+                "✔ success",
+                Style::default().fg(SUCCESS).add_modifier(Modifier::BOLD),
+            )));
+        }
+        EntryStatus::Failed => {
+            lines.push(Line::from(Span::styled(
+                "✘ failed",
+                Style::default().fg(FAILURE).add_modifier(Modifier::BOLD),
+            )));
+        }
+    }
+    for detail_line in entry.detail.lines() {
+        lines.push(Line::from(Span::styled(
+            format!("  {detail_line}"),
+            Style::default().fg(MUTED),
+        )));
+    }
+    lines.push(Line::raw(""));
+    lines
+}
+
+fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
+    let icon_color = breathing_color(app.tick_count, ACCENT_DIM, ACCENT);
+    let header = Paragraph::new(Line::from(vec![
+        Span::styled("✳ ", Style::default().fg(icon_color).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "rv-vectorize",
+            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  research LLVM loop vectorizer", Style::default().fg(MUTED)),
+    ]))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(ACCENT_DIM)),
+    );
+    frame.render_widget(header, area);
+}
+
+fn draw_config(frame: &mut Frame, app: &App, form_area: Rect, transcript_area: Rect) -> Rect {
+    let config_block = Block::default()
+        .title(" Configuration ")
+        .title_style(Style::default().fg(TEXT).add_modifier(Modifier::BOLD))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(ACCENT_DIM))
+        .padding(Padding::new(1, 1, 0, 0));
+    let inner = config_block.inner(form_area);
+    frame.render_widget(config_block, form_area);
+
+    let [fields_area, buttons_area] =
+        Layout::vertical([Constraint::Length(10), Constraint::Min(7)]).areas(inner);
+
+    let lines = vec![
+        field_line("Input", &app.input.value, app.focused == 0),
+        field_line("Output", &app.output.value, app.focused == 1),
+        Line::raw(""),
+        label_line("Policy"),
+        segmented_line(&POLICIES, app.policy, app.focused == 2),
+        label_line("Vector width"),
+        segmented_line(&VECTOR_WIDTHS, app.vector_width, app.focused == 3),
+        toggle_line("Report", app.report, app.focused == 4),
+        toggle_line("Verify", app.verify, app.focused == 5),
+        toggle_line("Bitcode", app.emit_bitcode, app.focused == 6),
+    ];
+    // Deliberately not wrapped: every entry above is exactly one row, and
+    // draw_cursor()/the field indices below assume that row == field
+    // index for the text fields. Wrapping a too-long value would push
+    // every row after it down and misalign both the cursor and the
+    // lower toggles, so a too-long value is clipped instead.
+    let fields = Paragraph::new(lines);
+    frame.render_widget(fields, fields_area);
+
+    let [run_area, _gap, diff_area] = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Length(1),
+        Constraint::Length(3),
+    ])
+    .areas(buttons_area);
+    draw_button(
+        frame,
+        run_area,
+        "▶",
+        "Run vectorizer",
+        app.focused == 7,
+        true,
+    );
+    let diff_label = if app.view == ViewMode::Diff {
+        "Hide diff"
+    } else {
+        "View diff"
+    };
+    draw_button(
+        frame,
+        diff_area,
+        "▤",
+        diff_label,
+        app.focused == 8,
+        app.diff_labels.is_some(),
+    );
+
+    let border_color = match (app.worker.is_some(), app.history.last()) {
+        (true, _) => PENDING,
+        (false, Some(entry)) => match entry.status {
+            EntryStatus::Running => PENDING,
+            EntryStatus::Success => SUCCESS,
+            EntryStatus::Failed => FAILURE,
         },
-        selected,
-    )
+        (false, None) => ACCENT_DIM,
+    };
+    let spinner = SPINNER[app.spinner_frame];
+    let mut transcript_lines = Vec::new();
+    if app.history.is_empty() {
+        transcript_lines.push(Line::styled(
+            "No runs yet. Configure the pass, then press Enter on Run or Ctrl-R.",
+            Style::default().fg(MUTED),
+        ));
+    } else {
+        for entry in &app.history {
+            transcript_lines.extend(history_lines(entry, spinner, app.tick_count));
+        }
+    }
+    let transcript = Paragraph::new(Text::from(transcript_lines))
+        .block(
+            Block::default()
+                .title(" Session ")
+                .title_style(Style::default().fg(TEXT).add_modifier(Modifier::BOLD))
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(border_color))
+                .padding(Padding::new(1, 1, 0, 0)),
+        )
+        .wrap(Wrap { trim: false })
+        .scroll((app.transcript_scroll, 0));
+    frame.render_widget(transcript, transcript_area);
+
+    fields_area
+}
+
+fn draw_diff(frame: &mut Frame, app: &App, area: Rect) {
+    let [left_area, right_area] =
+        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(area);
+    let (input_label, output_label) = app
+        .diff_labels
+        .as_ref()
+        .map_or((String::new(), String::new()), |(input, output)| {
+            (file_label(input), file_label(output))
+        });
+
+    let left = Paragraph::new(Text::from(diff_pane_lines(&app.diff_rows, Side::Left)))
+        .block(
+            Block::default()
+                .title(format!(" {input_label} (original) "))
+                .title_style(Style::default().fg(TEXT).add_modifier(Modifier::BOLD))
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(FAILURE))
+                .padding(Padding::new(1, 1, 0, 0)),
+        )
+        .wrap(Wrap { trim: false })
+        .scroll((app.diff_scroll, 0));
+    frame.render_widget(left, left_area);
+
+    let right = Paragraph::new(Text::from(diff_pane_lines(&app.diff_rows, Side::Right)))
+        .block(
+            Block::default()
+                .title(format!(" {output_label} (optimized) "))
+                .title_style(Style::default().fg(TEXT).add_modifier(Modifier::BOLD))
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(SUCCESS))
+                .padding(Padding::new(1, 1, 0, 0)),
+        )
+        .wrap(Wrap { trim: false })
+        .scroll((app.diff_scroll, 0));
+    frame.render_widget(right, right_area);
+}
+
+fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
+    let spans = if app.view == ViewMode::Diff {
+        vec![
+            Span::styled(" ❯ ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+            "↑↓/pgup/pgdn".fg(ACCENT).bold(),
+            Span::styled(" scroll  ", Style::default().fg(MUTED)),
+            "d/esc".fg(ACCENT).bold(),
+            Span::styled(" back  ", Style::default().fg(MUTED)),
+            "ctrl-c".fg(ACCENT).bold(),
+            Span::styled(" quit ", Style::default().fg(MUTED)),
+        ]
+    } else {
+        let mut spans = vec![
+            Span::styled(" ❯ ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+            "tab/↑↓".fg(ACCENT).bold(),
+            Span::styled(" next  ", Style::default().fg(MUTED)),
+            "←→".fg(ACCENT).bold(),
+            Span::styled(" change  ", Style::default().fg(MUTED)),
+            "enter/space".fg(ACCENT).bold(),
+            Span::styled(" select  ", Style::default().fg(MUTED)),
+            "ctrl-r".fg(ACCENT).bold(),
+            Span::styled(" run  ", Style::default().fg(MUTED)),
+        ];
+        if app.diff_labels.is_some() {
+            spans.push("ctrl-d".fg(ACCENT).bold());
+            spans.push(Span::styled(" diff  ", Style::default().fg(MUTED)));
+        }
+        spans.push("esc".fg(ACCENT).bold());
+        spans.push(Span::styled(" quit ", Style::default().fg(MUTED)));
+        spans
+    };
+    let footer = Paragraph::new(Line::from(spans)).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(ACCENT_DIM)),
+    );
+    frame.render_widget(footer, area);
 }
 
 fn draw(frame: &mut Frame, app: &App) {
@@ -379,92 +1076,24 @@ fn draw(frame: &mut Frame, app: &App) {
         Constraint::Length(3),
     ])
     .areas(frame.area());
-    let [form_area, log_area] =
-        Layout::horizontal([Constraint::Percentage(47), Constraint::Percentage(53)])
-            .areas(content_area);
 
-    let title = Paragraph::new(Line::from(vec![
-        Span::styled(" LLVM ", Style::default().fg(Color::Black).bg(Color::Cyan)),
-        Span::styled(
-            " Rust Loop Vectorizer ",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" interactive compiler pass"),
-    ]))
-    .block(Block::default().borders(Borders::ALL));
-    frame.render_widget(title, header_area);
+    draw_header(frame, app, header_area);
 
-    let lines = vec![
-        field_line("Input", &app.input.value, app.focused == 0),
-        field_line("Output", &app.output.value, app.focused == 1),
-        Line::raw(""),
-        field_line("Policy", POLICIES[app.policy], app.focused == 2),
-        field_line(
-            "Vector width",
-            VECTOR_WIDTHS[app.vector_width],
-            app.focused == 3,
-        ),
-        toggle_line("Report", app.report, app.focused == 4),
-        toggle_line("Verify", app.verify, app.focused == 5),
-        toggle_line("Bitcode", app.emit_bitcode, app.focused == 6),
-        Line::raw(""),
-        field_line("Action", "[ Run vectorizer ]", app.focused == 7),
-    ];
-    let form = Paragraph::new(lines)
-        .block(
-            Block::default()
-                .title(" Configuration ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray)),
-        )
-        .wrap(Wrap { trim: false });
-    frame.render_widget(form, form_area);
+    match app.view {
+        ViewMode::Config => {
+            let [form_area, transcript_area] =
+                Layout::horizontal([Constraint::Percentage(46), Constraint::Percentage(54)])
+                    .areas(content_area);
+            let fields_area = draw_config(frame, app, form_area, transcript_area);
+            draw_cursor(frame, app, fields_area);
+        }
+        ViewMode::Diff => draw_diff(frame, app, content_area),
+    }
 
-    let (status, color) = match app.state {
-        RunState::Ready => ("READY", Color::Yellow),
-        RunState::Success => ("SUCCESS", Color::Green),
-        RunState::Failed => ("FAILED", Color::Red),
-    };
-    let mut log_lines = vec![
-        Line::from(Span::styled(
-            status,
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        )),
-        Line::raw(""),
-    ];
-    log_lines.extend(app.log.lines().map(Line::raw));
-    let log = Paragraph::new(Text::from(log_lines))
-        .block(
-            Block::default()
-                .title(" Results ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(color)),
-        )
-        .wrap(Wrap { trim: false })
-        .scroll((app.log_scroll, 0));
-    frame.render_widget(log, log_area);
-
-    let footer = Paragraph::new(Line::from(vec![
-        " Tab/↑↓ ".black().on_cyan().bold(),
-        Span::raw(" navigate  "),
-        "←→".cyan().bold(),
-        Span::raw(" change  "),
-        "Enter/Space".cyan().bold(),
-        Span::raw(" select  "),
-        "Ctrl-R".green().bold(),
-        Span::raw(" run  "),
-        "Esc".red().bold(),
-        Span::raw(" quit "),
-    ]))
-    .block(Block::default().borders(Borders::ALL));
-    frame.render_widget(footer, footer_area);
-
-    draw_cursor(frame, app, form_area);
+    draw_footer(frame, app, footer_area);
 }
 
-fn draw_cursor(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_cursor(frame: &mut Frame, app: &App, fields_area: Rect) {
     let field = match app.focused {
         0 => &app.input,
         1 => &app.output,
@@ -472,9 +1101,9 @@ fn draw_cursor(frame: &mut Frame, app: &App, area: Rect) {
     };
     let row = u16::try_from(app.focused).unwrap_or_default();
     let cursor = u16::try_from(field.value[..field.cursor].chars().count()).unwrap_or(u16::MAX);
-    let x = area.x.saturating_add(13).saturating_add(cursor);
-    let y = area.y.saturating_add(1).saturating_add(row);
-    if x < area.right().saturating_sub(1) && y < area.bottom().saturating_sub(1) {
+    let x = fields_area.x.saturating_add(12).saturating_add(cursor);
+    let y = fields_area.y.saturating_add(row);
+    if x < fields_area.right() && y < fields_area.bottom() {
         frame.set_cursor_position((x, y));
     }
 }
@@ -483,9 +1112,12 @@ fn run(terminal: &mut DefaultTerminal) -> io::Result<()> {
     let mut app = App::default();
     while !app.quit {
         terminal.draw(|frame| draw(frame, &app))?;
-        if let Event::Key(key) = event::read()? {
-            app.handle_key(key);
+        if event::poll(TICK)? {
+            if let Event::Key(key) = event::read()? {
+                app.handle_key(key);
+            }
         }
+        app.tick();
     }
     Ok(())
 }
@@ -575,6 +1207,75 @@ mod tests {
     }
 
     #[test]
+    fn immediate_validation_failure_is_recorded_without_spawning_a_worker() {
+        let mut app = App {
+            input: TextField::new(""),
+            ..App::default()
+        };
+        app.execute();
+        assert!(app.worker.is_none());
+        assert_eq!(app.history.len(), 1);
+        assert_eq!(app.history[0].status, EntryStatus::Failed);
+    }
+
+    #[test]
+    fn history_is_capped() {
+        let mut app = App::default();
+        for _ in 0..(HISTORY_CAP + 3) {
+            app.push_history(HistoryEntry {
+                command: "x".to_owned(),
+                status: EntryStatus::Success,
+                detail: String::new(),
+            });
+        }
+        assert_eq!(app.history.len(), HISTORY_CAP);
+    }
+
+    #[test]
+    fn diff_view_is_unreachable_without_a_completed_run() {
+        let mut app = App::default();
+        app.toggle_diff_view();
+        assert_eq!(app.view, ViewMode::Config);
+    }
+
+    #[test]
+    fn diff_rows_align_context_additions_and_removals() {
+        let original = "a\nb\nc\n";
+        let optimized = "a\nb2\nc\nd\n";
+        let rows = build_diff_rows(original, optimized);
+
+        // "a" and "c" are unchanged context lines present on both sides.
+        assert!(rows.iter().any(|row| row.left_kind == RowKind::Context
+            && row.left_text == "a"
+            && row.right_text == "a"));
+        // "b" -> "b2" shows as a removal paired with an addition.
+        assert!(rows
+            .iter()
+            .any(|row| row.left_kind == RowKind::Removed && row.left_text == "b"));
+        assert!(rows
+            .iter()
+            .any(|row| row.right_kind == RowKind::Added && row.right_text == "b2"));
+        // The trailing "d" is a pure addition with an empty left side.
+        assert!(rows.iter().any(|row| row.right_text == "d"
+            && row.right_kind == RowKind::Added
+            && row.left_kind == RowKind::Empty));
+    }
+
+    #[test]
+    fn view_diff_button_only_activates_once_a_diff_exists() {
+        let mut app = App {
+            focused: 8,
+            ..App::default()
+        };
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.view, ViewMode::Config);
+
+        app.diff_labels = Some(("in.ll".to_owned(), "out.ll".to_owned()));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.view, ViewMode::Diff);
+    }
+
+    #[test]
     fn renders_at_typical_terminal_size() {
         let backend = TestBackend::new(120, 32);
         let mut terminal = Terminal::new(backend).expect("test terminal");
@@ -583,8 +1284,37 @@ mod tests {
             .expect("render TUI");
         let buffer = terminal.backend().buffer();
         let rendered = format!("{buffer:?}");
-        assert!(rendered.contains("Rust Loop Vectorizer"));
+        assert!(rendered.contains("rv-vectorize"));
         assert!(rendered.contains("Configuration"));
-        assert!(rendered.contains("Results"));
+        assert!(rendered.contains("Session"));
+        assert!(rendered.contains("No runs yet"));
+        // The CTA controls render as their own boxed buttons now, not
+        // plain "[ Run vectorizer ]" text inside the form list.
+        assert!(rendered.contains("Run vectorizer"));
+        assert!(rendered.contains("View diff"));
+        // Policy is a segmented control showing every option at once.
+        assert!(rendered.contains("balanced"));
+        assert!(rendered.contains("conservative"));
+        assert!(rendered.contains("aggressive"));
+    }
+
+    #[test]
+    fn renders_diff_view_when_active() {
+        let mut app = App {
+            diff_labels: Some(("in.ll".to_owned(), "out.ll".to_owned())),
+            diff_rows: build_diff_rows("a\nb\n", "a\nc\n"),
+            view: ViewMode::Diff,
+            ..App::default()
+        };
+        app.tick_count = 0;
+        let backend = TestBackend::new(120, 32);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| draw(frame, &app))
+            .expect("render TUI");
+        let buffer = terminal.backend().buffer();
+        let rendered = format!("{buffer:?}");
+        assert!(rendered.contains("original"));
+        assert!(rendered.contains("optimized"));
     }
 }
