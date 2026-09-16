@@ -1,0 +1,14 @@
+# Normalize every text file to LF, in the repository and in the working tree.
+#
+# core.autocrlf is a per-developer setting, so without this file the line
+# endings that reach a commit depend on whoever authored it. A contributor
+# working on Windows with autocrlf=false would commit CRLF, and the POSIX
+# drivers are executed directly on macOS and Linux:
+#
+#   ./scripts/test.sh
+#   ./scripts/differential_test.py
+#   ./scripts/benchmark.py
+#
+# A CRLF shebang fails there with "bad interpreter", so pin the encoding
+# rather than relying on every clone being configured the same way.
+* text=auto eol=lf
