@@ -125,8 +125,16 @@ Keyboard controls:
 | `←`, `→` | Move within text or change a selector. |
 | `Enter`, `Space` | Toggle a setting or activate the Run button. |
 | `Ctrl-R` | Run from anywhere in the application. |
-| `PageUp`, `PageDown` | Scroll the results pane. |
+| Mouse wheel | Scroll the session pane. |
+| `PageUp`, `PageDown` | Scroll the session pane by five rows. |
+| `Ctrl-↑`, `Ctrl-↓` | Scroll the session pane one row. |
+| `Home`, `End` | Jump to the oldest or newest output, unless a path field is focused. |
 | `Esc`, `Ctrl-C` | Exit and restore the terminal. |
+
+The session pane follows the newest output until you scroll up, shows a
+scrollbar whenever the transcript overflows, and resumes following once you
+scroll back to the bottom. Mouse reporting is enabled while the application
+runs, so hold `Shift` to use the terminal's own text selection.
 
 ### Direct LLVM invocation
 
@@ -206,9 +214,11 @@ Run the complete suite:
 ./scripts/test.sh
 ```
 
-It currently covers 27 Rust tests, the CLI and TUI applications, nine positive
-LLVM loops, conservative
-rejection fixtures, policy selection, forced VF, LLVM's verifier, native
+It currently covers 43 Rust tests, the CLI and TUI applications, nine positive
+LLVM loops plus a fourteen-loop breadth showcase spanning VF 2/4/8/16 and every
+supported element type, twenty-nine conservative rejection fixtures covering
+distinct named reasons, a byte-for-byte check that a fully rejected module is
+left unmodified, policy selection, forced VF, LLVM's verifier, native
 differential execution over boundary trip counts, all three supported latch
 forms, memory-order cases, and guard-page detection of tail over-read/write.
 
@@ -269,6 +279,10 @@ src/dependence.rs            affine GCD/exact-distance classifier
 src/cost.rs                  VF selection, cost score, vector coverage
 src/config.rs                heuristic profiles
 src/llvm.rs                  borrowed LLVM handle wrappers
+tests/fixtures/vectorizable.ll   canonical accepted loops
+tests/fixtures/showcase.ll       breadth showcase across VF, types, and opcodes
+tests/fixtures/rejected.ll       fail-closed dependence, alias, and CFG cases
+tests/fixtures/rejected-extra.ll fail-closed induction, memory, and shape cases
 tests/                       positive, negative, runtime, and layout tests
 benchmarks/                  fair scalar/custom/LLVM kernel corpus and harness
 scripts/test.sh              end-to-end verifier/runtime suite
