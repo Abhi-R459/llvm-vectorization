@@ -54,6 +54,35 @@ grep -q 'function=ordered_double_store .*decision=vectorized' "$build_dir/vector
 "$opt" \
   -load-pass-plugin="$plugin" \
   -passes='rust-loop-vectorize-report,verify' \
+  -S tests/fixtures/showcase.ll \
+  -o "$build_dir/showcase.ll" \
+  2>"$build_dir/showcase.remarks"
+
+showcase_loops=$(grep -c 'decision=vectorized' "$build_dir/showcase.remarks")
+[ "$showcase_loops" -eq 14 ]
+grep -q 'function=mul_add_f64 .*decision=vectorized.*vf=2' "$build_dir/showcase.remarks"
+grep -q 'function=mask_bits_i8 .*decision=vectorized.*vf=16' "$build_dir/showcase.remarks"
+grep -q 'function=add_half .*decision=vectorized.*vf=8' "$build_dir/showcase.remarks"
+grep -q 'function=xor_fold_i16 .*decision=vectorized.*vf=8' "$build_dir/showcase.remarks"
+grep -q 'function=widen_f32_to_f64 .*decision=vectorized.*vf=2' "$build_dir/showcase.remarks"
+grep -q 'function=widen_i8_to_i64 .*decision=vectorized.*vf=2' "$build_dir/showcase.remarks"
+grep -q 'function=scale_globals_i32 .*decision=vectorized.*vf=4' "$build_dir/showcase.remarks"
+grep -q 'function=neighbor_sum_i32 .*decision=vectorized.*vf=4' "$build_dir/showcase.remarks"
+grep -q 'load <16 x i8>' "$build_dir/showcase.ll"
+grep -q 'fadd <8 x half>' "$build_dir/showcase.ll"
+grep -q 'fadd <2 x double>' "$build_dir/showcase.ll"
+grep -q 'fneg <4 x float>' "$build_dir/showcase.ll"
+grep -q 'udiv <4 x i32>' "$build_dir/showcase.ll"
+grep -q 'urem <4 x i32>' "$build_dir/showcase.ll"
+grep -q 'ashr <4 x i32>' "$build_dir/showcase.ll"
+grep -q 'fcmp olt <4 x float>' "$build_dir/showcase.ll"
+grep -q 'sitofp <4 x i32>' "$build_dir/showcase.ll"
+grep -q 'fpext <2 x float>' "$build_dir/showcase.ll"
+grep -q 'fptrunc <2 x double>' "$build_dir/showcase.ll"
+
+"$opt" \
+  -load-pass-plugin="$plugin" \
+  -passes='rust-loop-vectorize-report,verify' \
   -S tests/fixtures/rejected.ll \
   -o "$build_dir/rejected-output.ll" \
   2>"$build_dir/rejected.remarks"
@@ -78,6 +107,56 @@ grep -q 'function=induction_next_data_use .*reason=induction-next-has-data-use' 
 grep -q 'function=latch_compare_data_use .*reason=latch-compare-has-data-use' "$build_dir/rejected.remarks"
 if grep 'function=optimization_disabled ' "$build_dir/rejected.remarks" >/dev/null; then
   printf '%s\n' 'an optnone function was analyzed' >&2
+  exit 1
+fi
+
+"$opt" \
+  -load-pass-plugin="$plugin" \
+  -passes='rust-loop-vectorize-report,verify' \
+  -S tests/fixtures/rejected-extra.ll \
+  -o "$build_dir/rejected-extra-output.ll" \
+  2>"$build_dir/rejected-extra.remarks"
+
+extra_rejections=$(grep -c 'decision=rejected' "$build_dir/rejected-extra.remarks")
+[ "$extra_rejections" -eq 14 ]
+if grep -q 'decision=vectorized' "$build_dir/rejected-extra.remarks"; then
+  printf '%s\n' 'a known-unsupported loop was vectorized' >&2
+  exit 1
+fi
+grep -q 'function=nonzero_start .*reason=induction-must-start-at-zero' \
+  "$build_dir/rejected-extra.remarks"
+grep -q 'function=stride_two .*reason=induction-step-must-be-one' \
+  "$build_dir/rejected-extra.remarks"
+grep -q 'function=i32_induction .*reason=induction-type-must-be-i64' \
+  "$build_dir/rejected-extra.remarks"
+grep -q 'function=signed_latch .*reason=unsupported-latch-predicate' \
+  "$build_dir/rejected-extra.remarks"
+grep -q 'function=exit_phi .*reason=live-out-phi' "$build_dir/rejected-extra.remarks"
+grep -q 'function=scaled_index .*reason=non-affine-index' "$build_dir/rejected-extra.remarks"
+grep -q 'function=stack_base .*reason=unsupported-pointer-base' \
+  "$build_dir/rejected-extra.remarks"
+grep -q 'function=pointer_element .*reason=unsupported-memory-element-type' \
+  "$build_dir/rejected-extra.remarks"
+grep -q 'function=invariant_store_pointer .*reason=memory-pointer-must-be-loop-gep' \
+  "$build_dir/rejected-extra.remarks"
+grep -q 'function=two_header_phis .*reason=multiple-header-phis' \
+  "$build_dir/rejected-extra.remarks"
+grep -q 'function=no_memory .*reason=no-memory-access' "$build_dir/rejected-extra.remarks"
+grep -q 'function=mixed_size_access .*reason=mixed-size-memory-access' \
+  "$build_dir/rejected-extra.remarks"
+grep -q 'function=two_index_gep .*reason=gep-must-have-one-index' \
+  "$build_dir/rejected-extra.remarks"
+grep -q 'function=atomic_access .*reason=volatile-or-atomic-memory' \
+  "$build_dir/rejected-extra.remarks"
+
+# A rejection must leave the module byte-identical to the untransformed input,
+# which is the observable form of the no-mutation-before-acceptance invariant.
+"$opt" \
+  -passes='verify' \
+  -S tests/fixtures/rejected-extra.ll \
+  -o "$build_dir/rejected-extra-baseline.ll"
+if ! cmp -s "$build_dir/rejected-extra-baseline.ll" "$build_dir/rejected-extra-output.ll"; then
+  printf '%s\n' 'a fully rejected module was mutated' >&2
   exit 1
 fi
 
@@ -177,4 +256,5 @@ llvm_cxxflags=$("$llvm_prefix/bin/llvm-config" --cxxflags)
   -o "$build_dir/runtime-check"
 "$build_dir/runtime-check"
 
-printf 'verified: %s vectorized loops, CLI, conservative bailouts, LLVM IR verifier, runtime tails\n' "$vector_loops"
+printf 'verified: %s+%s vectorized loops, %s+%s fail-closed rejections, CLI, conservative bailouts, LLVM IR verifier, runtime tails\n' \
+  "$vector_loops" "$showcase_loops" "$(grep -c 'decision=rejected' "$build_dir/rejected.remarks")" "$extra_rejections"
