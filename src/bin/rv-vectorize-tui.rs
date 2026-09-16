@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::env;
 use std::fmt;
 use std::fs;
@@ -8,11 +9,18 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use ratatui::layout::{Alignment, Constraint, Layout, Rect};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseEvent, MouseEventKind,
+};
+use crossterm::execute;
+use ratatui::layout::{Alignment, Constraint, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, BorderType, Borders, Padding, Paragraph, Scrollbar, ScrollbarOrientation,
+    ScrollbarState, Wrap,
+};
 use ratatui::{DefaultTerminal, Frame};
 use similar::{DiffOp, TextDiff};
 
@@ -155,6 +163,13 @@ struct App {
     focused: usize,
     history: Vec<HistoryEntry>,
     transcript_scroll: u16,
+    /// Stick to the newest output until the reader scrolls up by hand.
+    transcript_follow: bool,
+    /// Wrapped row count and visible height measured by the last render. The
+    /// draw path is the only place the real geometry is known, so scrolling
+    /// clamps against what was actually shown.
+    transcript_content: Cell<u16>,
+    transcript_viewport: Cell<u16>,
     spinner_frame: usize,
     tick_count: u64,
     worker: Option<Receiver<WorkerResult>>,
@@ -193,6 +208,9 @@ impl Default for App {
             focused: 0,
             history: Vec::new(),
             transcript_scroll: 0,
+            transcript_follow: true,
+            transcript_content: Cell::new(0),
+            transcript_viewport: Cell::new(0),
             spinner_frame: 0,
             tick_count: 0,
             worker: None,
@@ -208,6 +226,62 @@ impl Default for App {
 }
 
 impl App {
+    /// Largest useful scroll offset for the session pane, from the geometry
+    /// measured during the previous render.
+    fn transcript_max_scroll(&self) -> u16 {
+        self.transcript_content
+            .get()
+            .saturating_sub(self.transcript_viewport.get())
+    }
+
+    /// Offset to render with. Following pins the view to the newest output;
+    /// otherwise a stale offset is clamped so the pane can never scroll off
+    /// into empty space below the transcript.
+    fn transcript_offset(&self) -> u16 {
+        if self.transcript_follow {
+            self.transcript_max_scroll()
+        } else {
+            self.transcript_scroll.min(self.transcript_max_scroll())
+        }
+    }
+
+    fn scroll_transcript(&mut self, delta: i32) {
+        let maximum = self.transcript_max_scroll();
+        let current = i64::from(self.transcript_offset());
+        let target = (current + i64::from(delta)).clamp(0, i64::from(maximum));
+        self.transcript_scroll = u16::try_from(target).unwrap_or(maximum);
+        // Reaching the bottom re-arms following, so a reader who scrolls back
+        // down keeps seeing new output without pressing End.
+        self.transcript_follow = self.transcript_scroll >= maximum;
+    }
+
+    fn scroll_transcript_to_top(&mut self) {
+        self.transcript_scroll = 0;
+        self.transcript_follow = self.transcript_max_scroll() == 0;
+    }
+
+    fn scroll_transcript_to_bottom(&mut self) {
+        self.transcript_scroll = self.transcript_max_scroll();
+        self.transcript_follow = true;
+    }
+
+    fn handle_mouse(&mut self, event: MouseEvent) {
+        let delta = match event.kind {
+            MouseEventKind::ScrollUp => -3,
+            MouseEventKind::ScrollDown => 3,
+            _ => return,
+        };
+        if self.view == ViewMode::Diff {
+            self.diff_scroll = if delta < 0 {
+                self.diff_scroll.saturating_sub(3)
+            } else {
+                self.diff_scroll.saturating_add(3)
+            };
+            return;
+        }
+        self.scroll_transcript(delta);
+    }
+
     fn next_field(&mut self) {
         self.focused = (self.focused + 1) % FIELD_COUNT;
     }
@@ -296,10 +370,18 @@ impl App {
         }
         match key.code {
             KeyCode::Esc => self.quit = true,
+            // Ctrl with the arrow keys scrolls the session pane line by line,
+            // leaving the bare arrows for moving between controls.
+            KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.scroll_transcript(-1);
+            }
+            KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.scroll_transcript(1);
+            }
             KeyCode::Tab | KeyCode::Down => self.next_field(),
             KeyCode::BackTab | KeyCode::Up => self.previous_field(),
-            KeyCode::PageUp => self.transcript_scroll = self.transcript_scroll.saturating_sub(5),
-            KeyCode::PageDown => self.transcript_scroll = self.transcript_scroll.saturating_add(5),
+            KeyCode::PageUp => self.scroll_transcript(-5),
+            KeyCode::PageDown => self.scroll_transcript(5),
             KeyCode::Left => {
                 if let Some(field) = self.selected_text_field() {
                     field.move_left();
@@ -314,14 +396,20 @@ impl App {
                     self.cycle_selected(true);
                 }
             }
+            // On a text control these move the caret; anywhere else they jump
+            // the session pane to the oldest or newest output.
             KeyCode::Home => {
                 if let Some(field) = self.selected_text_field() {
                     field.cursor = 0;
+                } else {
+                    self.scroll_transcript_to_top();
                 }
             }
             KeyCode::End => {
                 if let Some(field) = self.selected_text_field() {
                     field.cursor = field.value.len();
+                } else {
+                    self.scroll_transcript_to_bottom();
                 }
             }
             KeyCode::Backspace => {
@@ -392,7 +480,9 @@ impl App {
         while self.history.len() > HISTORY_CAP {
             self.history.remove(0);
         }
-        self.transcript_scroll = 0;
+        // New output jumps back to the newest entry rather than to the top of
+        // the transcript, which is what a reader watching a run expects.
+        self.transcript_follow = true;
     }
 
     /// Kick off the configured `rv-vectorize` invocation on a background
@@ -596,7 +686,11 @@ fn build_diff_rows(original: &str, optimized: &str) -> Vec<DiffRow> {
                 for offset in 0..old_len {
                     rows.push(DiffRow {
                         left_no: Some(old_index + offset + 1),
-                        left_text: old_lines.get(old_index + offset).copied().unwrap_or("").to_owned(),
+                        left_text: old_lines
+                            .get(old_index + offset)
+                            .copied()
+                            .unwrap_or("")
+                            .to_owned(),
                         left_kind: RowKind::Removed,
                         right_no: None,
                         right_text: String::new(),
@@ -613,7 +707,11 @@ fn build_diff_rows(original: &str, optimized: &str) -> Vec<DiffRow> {
                         left_text: String::new(),
                         left_kind: RowKind::Empty,
                         right_no: Some(new_index + offset + 1),
-                        right_text: new_lines.get(new_index + offset).copied().unwrap_or("").to_owned(),
+                        right_text: new_lines
+                            .get(new_index + offset)
+                            .copied()
+                            .unwrap_or("")
+                            .to_owned(),
                         right_kind: RowKind::Added,
                     });
                 }
@@ -629,7 +727,11 @@ fn build_diff_rows(original: &str, optimized: &str) -> Vec<DiffRow> {
                     let (left_no, left_text, left_kind) = if offset < old_len {
                         (
                             Some(old_index + offset + 1),
-                            old_lines.get(old_index + offset).copied().unwrap_or("").to_owned(),
+                            old_lines
+                                .get(old_index + offset)
+                                .copied()
+                                .unwrap_or("")
+                                .to_owned(),
                             RowKind::Removed,
                         )
                     } else {
@@ -638,7 +740,11 @@ fn build_diff_rows(original: &str, optimized: &str) -> Vec<DiffRow> {
                     let (right_no, right_text, right_kind) = if offset < new_len {
                         (
                             Some(new_index + offset + 1),
-                            new_lines.get(new_index + offset).copied().unwrap_or("").to_owned(),
+                            new_lines
+                                .get(new_index + offset)
+                                .copied()
+                                .unwrap_or("")
+                                .to_owned(),
                             RowKind::Added,
                         )
                     } else {
@@ -796,7 +902,14 @@ fn label_line(label: &'static str) -> Line<'static> {
 /// Render a real bordered button widget (not just inline text) — a
 /// rounded box that fills solid with the accent color while focused, and
 /// dims down when its action isn't currently available.
-fn draw_button(frame: &mut Frame, area: Rect, icon: &str, label: &str, selected: bool, enabled: bool) {
+fn draw_button(
+    frame: &mut Frame,
+    area: Rect,
+    icon: &str,
+    label: &str,
+    selected: bool,
+    enabled: bool,
+) {
     let block = if selected && enabled {
         Block::default()
             .borders(Borders::ALL)
@@ -874,12 +987,18 @@ fn history_lines(entry: &HistoryEntry, spinner: &str, tick: u64) -> Vec<Line<'st
 fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     let icon_color = breathing_color(app.tick_count, ACCENT_DIM, ACCENT);
     let header = Paragraph::new(Line::from(vec![
-        Span::styled("✳ ", Style::default().fg(icon_color).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "✳ ",
+            Style::default().fg(icon_color).add_modifier(Modifier::BOLD),
+        ),
         Span::styled(
             "rv-vectorize",
             Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
         ),
-        Span::styled("  research LLVM loop vectorizer", Style::default().fg(MUTED)),
+        Span::styled(
+            "  research LLVM loop vectorizer",
+            Style::default().fg(MUTED),
+        ),
     ]))
     .block(
         Block::default()
@@ -952,6 +1071,14 @@ fn draw_config(frame: &mut Frame, app: &App, form_area: Rect, transcript_area: R
         app.diff_labels.is_some(),
     );
 
+    draw_transcript(frame, app, transcript_area);
+
+    fields_area
+}
+
+/// Renders the session transcript, which is the one scrollable pane on the
+/// configuration screen.
+fn draw_transcript(frame: &mut Frame, app: &App, transcript_area: Rect) {
     let border_color = match (app.worker.is_some(), app.history.last()) {
         (true, _) => PENDING,
         (false, Some(entry)) => match entry.status {
@@ -973,21 +1100,104 @@ fn draw_config(frame: &mut Frame, app: &App, form_area: Rect, transcript_area: R
             transcript_lines.extend(history_lines(entry, spinner, app.tick_count));
         }
     }
-    let transcript = Paragraph::new(Text::from(transcript_lines))
+    // Wrap here rather than leaving it to Paragraph, so the rendered row count
+    // is known exactly and scrolling can be clamped to real content.
+    let inner_width = transcript_area.width.saturating_sub(4);
+    let wrapped = wrap_lines(&transcript_lines, inner_width);
+    let viewport = transcript_area.height.saturating_sub(2);
+    app.transcript_content
+        .set(u16::try_from(wrapped.len()).unwrap_or(u16::MAX));
+    app.transcript_viewport.set(viewport);
+    let offset = app.transcript_offset();
+
+    let title = if app.transcript_content.get() > viewport && !app.transcript_follow {
+        " Session (scrolled) "
+    } else {
+        " Session "
+    };
+    let transcript = Paragraph::new(Text::from(wrapped))
         .block(
             Block::default()
-                .title(" Session ")
+                .title(title)
                 .title_style(Style::default().fg(TEXT).add_modifier(Modifier::BOLD))
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(border_color))
                 .padding(Padding::new(1, 1, 0, 0)),
         )
-        .wrap(Wrap { trim: false })
-        .scroll((app.transcript_scroll, 0));
+        .scroll((offset, 0));
     frame.render_widget(transcript, transcript_area);
 
-    fields_area
+    if app.transcript_content.get() > viewport {
+        let mut state = ScrollbarState::new(usize::from(app.transcript_max_scroll()))
+            .position(usize::from(offset));
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None)
+                .track_symbol(Some("│"))
+                .thumb_symbol("█")
+                .track_style(Style::default().fg(ACCENT_DIM))
+                .thumb_style(Style::default().fg(ACCENT)),
+            transcript_area.inner(Margin {
+                vertical: 1,
+                horizontal: 0,
+            }),
+            &mut state,
+        );
+    }
+}
+
+/// Greedily word-wraps styled lines to `width`, preserving each span's style
+/// and hard-splitting words that cannot fit on a line of their own.
+fn wrap_lines(lines: &[Line<'static>], width: u16) -> Vec<Line<'static>> {
+    if width == 0 {
+        return lines.to_vec();
+    }
+    let limit = usize::from(width);
+    let mut wrapped = Vec::new();
+
+    for line in lines {
+        let mut current: Vec<Span<'static>> = Vec::new();
+        let mut used = 0_usize;
+
+        for span in &line.spans {
+            let style = span.style;
+            for (index, word) in span.content.split(' ').enumerate() {
+                // `split` yields an empty leading item for a leading space, so
+                // index > 0 is exactly "there was a separator before this".
+                if index > 0 && used < limit && !current.is_empty() {
+                    current.push(Span::styled(" ".to_owned(), style));
+                    used += 1;
+                }
+                let mut rest = word;
+                while !rest.is_empty() {
+                    let remaining = limit.saturating_sub(used);
+                    if remaining == 0 {
+                        wrapped.push(Line::from(std::mem::take(&mut current)));
+                        used = 0;
+                        continue;
+                    }
+                    let take = rest.chars().count().min(remaining);
+                    let split_at = rest
+                        .char_indices()
+                        .nth(take)
+                        .map_or(rest.len(), |(offset, _)| offset);
+                    let (head, tail) = rest.split_at(split_at);
+                    current.push(Span::styled(head.to_owned(), style));
+                    used += take;
+                    rest = tail;
+                    if !rest.is_empty() {
+                        wrapped.push(Line::from(std::mem::take(&mut current)));
+                        used = 0;
+                    }
+                }
+            }
+        }
+        // Always emit the line, so blank separator lines keep their height.
+        wrapped.push(Line::from(current));
+    }
+    wrapped
 }
 
 fn draw_diff(frame: &mut Frame, app: &App, area: Rect) {
@@ -1032,7 +1242,10 @@ fn draw_diff(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     let spans = if app.view == ViewMode::Diff {
         vec![
-            Span::styled(" ❯ ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                " ❯ ",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
             "↑↓/pgup/pgdn".fg(ACCENT).bold(),
             Span::styled(" scroll  ", Style::default().fg(MUTED)),
             "d/esc".fg(ACCENT).bold(),
@@ -1042,7 +1255,10 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         ]
     } else {
         let mut spans = vec![
-            Span::styled(" ❯ ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                " ❯ ",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
             "tab/↑↓".fg(ACCENT).bold(),
             Span::styled(" next  ", Style::default().fg(MUTED)),
             "←→".fg(ACCENT).bold(),
@@ -1051,6 +1267,8 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled(" select  ", Style::default().fg(MUTED)),
             "ctrl-r".fg(ACCENT).bold(),
             Span::styled(" run  ", Style::default().fg(MUTED)),
+            "wheel/pgup/pgdn".fg(ACCENT).bold(),
+            Span::styled(" scroll  ", Style::default().fg(MUTED)),
         ];
         if app.diff_labels.is_some() {
             spans.push("ctrl-d".fg(ACCENT).bold());
@@ -1113,8 +1331,10 @@ fn run(terminal: &mut DefaultTerminal) -> io::Result<()> {
     while !app.quit {
         terminal.draw(|frame| draw(frame, &app))?;
         if event::poll(TICK)? {
-            if let Event::Key(key) = event::read()? {
-                app.handle_key(key);
+            match event::read()? {
+                Event::Key(key) => app.handle_key(key),
+                Event::Mouse(mouse) => app.handle_mouse(mouse),
+                _ => {}
             }
         }
         app.tick();
@@ -1124,7 +1344,13 @@ fn run(terminal: &mut DefaultTerminal) -> io::Result<()> {
 
 fn main() -> io::Result<()> {
     let mut terminal = ratatui::init();
+    // Wheel events require mouse reporting. While it is on, the terminal's own
+    // drag-select is suppressed; most terminals still select with Shift held.
+    let mouse = execute!(io::stdout(), EnableMouseCapture);
     let result = run(&mut terminal);
+    if mouse.is_ok() {
+        let _ = execute!(io::stdout(), DisableMouseCapture);
+    }
     ratatui::restore();
     result
 }
@@ -1231,6 +1457,113 @@ mod tests {
         assert_eq!(app.history.len(), HISTORY_CAP);
     }
 
+    /// Pretend the last render measured `content` rows in a `viewport`-row pane.
+    fn measured(content: u16, viewport: u16) -> App {
+        let app = App::default();
+        app.transcript_content.set(content);
+        app.transcript_viewport.set(viewport);
+        app
+    }
+
+    #[test]
+    fn transcript_scroll_is_clamped_to_measured_content() {
+        let mut app = measured(50, 20);
+        assert_eq!(app.transcript_max_scroll(), 30);
+        app.scroll_transcript(1000);
+        assert_eq!(app.transcript_scroll, 30);
+        app.scroll_transcript(-1000);
+        assert_eq!(app.transcript_scroll, 0);
+    }
+
+    #[test]
+    fn short_transcripts_cannot_scroll_at_all() {
+        let mut app = measured(5, 20);
+        app.scroll_transcript(10);
+        assert_eq!(app.transcript_offset(), 0);
+        assert_eq!(app.transcript_max_scroll(), 0);
+    }
+
+    #[test]
+    fn scrolling_up_stops_following_and_returning_to_the_bottom_resumes_it() {
+        let mut app = measured(50, 20);
+        assert!(app.transcript_follow);
+        app.scroll_transcript(-5);
+        assert!(!app.transcript_follow);
+        assert_eq!(app.transcript_offset(), 25);
+        app.scroll_transcript(5);
+        assert!(app.transcript_follow);
+    }
+
+    #[test]
+    fn new_output_returns_to_the_newest_entry() {
+        let mut app = measured(50, 20);
+        app.scroll_transcript_to_top();
+        assert!(!app.transcript_follow);
+        app.push_history(HistoryEntry {
+            command: "x".to_owned(),
+            status: EntryStatus::Success,
+            detail: String::new(),
+        });
+        assert!(app.transcript_follow);
+        assert_eq!(app.transcript_offset(), app.transcript_max_scroll());
+    }
+
+    #[test]
+    fn a_grown_transcript_keeps_a_pinned_offset_in_range() {
+        let mut app = measured(50, 20);
+        app.scroll_transcript(-10);
+        assert_eq!(app.transcript_offset(), 20);
+        // The pane shrinks; the stale offset must not point past the content.
+        app.transcript_content.set(25);
+        assert_eq!(app.transcript_offset(), 5);
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_the_session_pane() {
+        let mut app = measured(50, 20);
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.transcript_offset(), 27);
+        assert!(!app.transcript_follow);
+    }
+
+    #[test]
+    fn wrapping_splits_long_lines_and_preserves_blank_rows() {
+        let lines = vec![
+            Line::from("aaa bbb ccc"),
+            Line::from(""),
+            Line::from("short"),
+        ];
+        let wrapped = wrap_lines(&lines, 7);
+        let rendered: Vec<String> = wrapped
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        assert_eq!(rendered, vec!["aaa bbb", "ccc", "", "short"]);
+    }
+
+    #[test]
+    fn wrapping_hard_splits_a_word_longer_than_the_pane() {
+        let lines = vec![Line::from("abcdefghij")];
+        let wrapped = wrap_lines(&lines, 4);
+        assert_eq!(wrapped.len(), 3);
+    }
+
+    #[test]
+    fn zero_width_wrapping_does_not_loop_forever() {
+        let lines = vec![Line::from("anything at all")];
+        assert_eq!(wrap_lines(&lines, 0).len(), 1);
+    }
+
     #[test]
     fn diff_view_is_unreachable_without_a_completed_run() {
         let mut app = App::default();
@@ -1249,12 +1582,14 @@ mod tests {
             && row.left_text == "a"
             && row.right_text == "a"));
         // "b" -> "b2" shows as a removal paired with an addition.
-        assert!(rows
-            .iter()
-            .any(|row| row.left_kind == RowKind::Removed && row.left_text == "b"));
-        assert!(rows
-            .iter()
-            .any(|row| row.right_kind == RowKind::Added && row.right_text == "b2"));
+        assert!(
+            rows.iter()
+                .any(|row| row.left_kind == RowKind::Removed && row.left_text == "b")
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.right_kind == RowKind::Added && row.right_text == "b2")
+        );
         // The trailing "d" is a pure addition with an empty left side.
         assert!(rows.iter().any(|row| row.right_text == "d"
             && row.right_kind == RowKind::Added
@@ -1273,6 +1608,47 @@ mod tests {
         app.diff_labels = Some(("in.ll".to_owned(), "out.ll".to_owned()));
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(app.view, ViewMode::Diff);
+    }
+
+    /// Renders a transcript that cannot fit, then checks that the pane really
+    /// moves on screen and that the scrollbar only appears when it should.
+    #[test]
+    fn overflowing_transcript_renders_a_scrollbar_and_moves_when_scrolled() {
+        let mut app = App::default();
+        for index in 0..12 {
+            app.push_history(HistoryEntry {
+                command: format!("run-number-{index}"),
+                status: EntryStatus::Success,
+                detail: format!("line one of {index}\nline two of {index}"),
+            });
+        }
+        let mut terminal = Terminal::new(TestBackend::new(120, 32)).expect("test terminal");
+
+        terminal.draw(|frame| draw(frame, &app)).expect("render");
+        let following = format!("{:?}", terminal.backend().buffer());
+        assert!(
+            app.transcript_max_scroll() > 0,
+            "the fixture should overflow the pane"
+        );
+        assert!(following.contains('█'), "a scrollbar thumb should be drawn");
+        // Following pins the newest entry into view.
+        assert!(following.contains("run-number-11"));
+
+        app.scroll_transcript_to_top();
+        terminal.draw(|frame| draw(frame, &app)).expect("render");
+        let scrolled = format!("{:?}", terminal.backend().buffer());
+        assert_ne!(
+            following, scrolled,
+            "scrolling must change what is displayed"
+        );
+        assert!(scrolled.contains("Session (scrolled)"));
+        assert!(!scrolled.contains("run-number-11"));
+
+        // A transcript that fits needs no scrollbar.
+        let empty = App::default();
+        terminal.draw(|frame| draw(frame, &empty)).expect("render");
+        let short = format!("{:?}", terminal.backend().buffer());
+        assert!(!short.contains('█'));
     }
 
     #[test]
